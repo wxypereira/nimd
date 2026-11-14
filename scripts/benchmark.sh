@@ -1,0 +1,79 @@
+#!/bin/bash
+# benchmark.sh - CPU benchmarks para comparar antes/depois do performance.sh
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+RESULTS_DIR="${PROJECT_ROOT}/data/benchmarks"
+mkdir -p "$RESULTS_DIR"
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTFILE="${RESULTS_DIR}/benchmark_${TIMESTAMP}.log"
+
+log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUTFILE"; }
+
+log "=== BENCHMARK INICIADO ==="
+log "Host: $(hostname)"
+log "Kernel: $(uname -r)"
+log "CPU: $(lscpu | grep 'Model name' | cut -d: -f2 | xargs)"
+log "Governor atual: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo 'N/A')"
+log ""
+
+# ============================================================================
+# 1. STRESS-NG CPU TEST (single thread)
+# ============================================================================
+log "=== 1. stress-ng CPU single thread (60s) ==="
+stress-ng --cpu 1 --cpu-method all --metrics-brief --timeout 60s 2>&1 | tee -a "$OUTFILE"
+log ""
+
+# ============================================================================
+# 2. STRESS-NG CPU TEST (all cores)
+# ============================================================================
+log "=== 2. stress-ng CPU all cores (60s) ==="
+NCORES=$(nproc)
+stress-ng --cpu "$NCORES" --cpu-method all --metrics-brief --timeout 60s 2>&1 | tee -a "$OUTFILE"
+log ""
+
+# ============================================================================
+# 3. SYSBENCH CPU (prime numbers)
+# ============================================================================
+log "=== 3. sysbench CPU (prime, 60s) ==="
+sysbench cpu --cpu-max-prime=100000 --threads=1 --time=60 --report-interval=10 run 2>&1 | tee -a "$OUTFILE"
+log ""
+
+# ============================================================================
+# 4. SYSBENCH CPU MULTI-THREAD
+# ============================================================================
+log "=== 4. sysbench CPU multi-thread (prime, 60s) ==="
+sysbench cpu --cpu-max-prime=100000 --threads="$NCORES" --time=60 --report-interval=10 run 2>&1 | tee -a "$OUTFILE"
+log ""
+
+# ============================================================================
+# 5. STRESS-NG MEMORY BANDWIDTH
+# ============================================================================
+log "=== 5. stress-ng memory bandwidth (30s) ==="
+stress-ng --vm 2 --vm-bytes 80% --vm-keep --metrics-brief --timeout 30s 2>&1 | tee -a "$OUTFILE"
+log ""
+
+# ============================================================================
+# 6. STRESS-NG CONTEXT SWITCHING (using --switch)
+# ============================================================================
+log "=== 6. stress-ng context switching (30s) ==="
+stress-ng --switch "$NCORES" --metrics-brief --timeout 30s 2>&1 | tee -a "$OUTFILE"
+log ""
+
+# ============================================================================
+# 7. FREQUENCY INFO
+# ============================================================================
+log "=== 7. Frequências durante benchmark ==="
+for i in {1..5}; do
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do
+        [[ -f "$cpu" ]] && cat "$cpu"
+    done | awk '{sum+=$1} END {print "Media:", sum/NR/1000, "MHz"}'
+    sleep 2
+done | tee -a "$OUTFILE"
+log ""
+
+log "=== BENCHMARK CONCLUÍDO ==="
+log "Resultado salvo em: $OUTFILE"

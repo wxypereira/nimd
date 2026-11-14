@@ -1,0 +1,155 @@
+#!/bin/bash
+# performance.sh - Maximiza performance da CPU sem limites
+# Requer: sudo / root
+
+set -euo pipefail
+
+# Cores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+log_ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_err()  { echo -e "${RED}[ERR]${NC} $*"; }
+
+# Verifica se é root
+if [[ $EUID -ne 0 ]]; then
+    log_err "Este script deve ser executado como root (use sudo)"
+    exit 1
+fi
+
+# ============================================================================
+# CONFIGURAÇÕES CPUFREQ / CPUPOWER
+# ============================================================================
+
+log_info "=== Configurando CPU Governor para PERFORMANCE ==="
+
+# Define governor performance em todos os CPUs
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    if [[ -f "$cpu" ]]; then
+        echo "performance" > "$cpu" && log_ok "Governor performance: ${cpu}" || log_warn "Falha ao definir: ${cpu}"
+    fi
+done
+
+# Define frequência mínima = máxima (sem throttling)
+log_info "=== Removendo limites de frequência ==="
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/; do
+    if [[ -f "${cpu}scaling_min_freq" && -f "${cpu}scaling_max_freq" ]]; then
+        max_freq=$(cat "${cpu}scaling_max_freq")
+        echo "$max_freq" > "${cpu}scaling_min_freq" && log_ok "Min freq = Max freq: ${cpu}" || log_warn "Falha ao igualar min/max: ${cpu}"
+    fi
+done
+
+# Habilita Intel P-state no modo performance (se disponível)
+if [[ -d /sys/devices/system/cpu/intel_pstate ]]; then
+    log_info "=== Configurando Intel P-State ==="
+    echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null && log_ok "Turbo Boost habilitado" || log_warn "Turbo já habilitado ou indisponível"
+    echo "performance" > /sys/devices/system/cpu/intel_pstate/status 2>/dev/null && log_ok "P-State no modo performance" || log_warn "P-State performance indisponível"
+fi
+
+# Habilita AMD P-state (se disponível)
+if [[ -d /sys/devices/system/cpu/amd_pstate ]]; then
+    log_info "=== Configurando AMD P-State ==="
+    echo "performance" > /sys/devices/system/cpu/amd_pstate/status 2>/dev/null && log_ok "AMD P-State performance" || log_warn "AMD P-State indisponível"
+fi
+
+# ============================================================================
+# CPU BOOST / TURBO
+# ============================================================================
+
+log_info "=== Habilitando CPU Boost ==="
+# Intel
+for boost_file in /sys/devices/system/cpu/cpufreq/boost /sys/devices/system/cpu/intel_pstate/no_turbo; do
+    if [[ -f "$boost_file" ]]; then
+        case "$boost_file" in
+            *boost) echo 1 > "$boost_file" && log_ok "Boost habilitado: $boost_file" ;;
+            *no_turbo) echo 0 > "$boost_file" && log_ok "Turbo habilitado: $boost_file" ;;
+        esac
+    fi
+done
+
+# ============================================================================
+# SYSTEMD - Desabilita serviços de economia de energia
+# ============================================================================
+
+log_info "=== Desabilitando serviços de power saving ==="
+
+SERVICES_TO_DISABLE=(
+    "thermald"
+    "tuned"
+    "power-profiles-daemon"
+    "upower"
+    "tlp"
+    "auto-cpufreq"
+    "cpufreqd"
+    "laptop-mode"
+    "intel-undervolt"
+    "amd-pstate-epp"
+)
+
+for svc in "${SERVICES_TO_DISABLE[@]}"; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        systemctl stop "$svc" && log_ok "Parado: $svc" || log_warn "Falha ao parar: $svc"
+    fi
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+        systemctl disable "$svc" && log_ok "Desabilitado no boot: $svc" || log_warn "Falha ao desabilitar: $svc"
+    fi
+done
+
+# Mask serviços que podem reiniciar sozinhos
+for svc in thermald tuned power-profiles-daemon; do
+    systemctl mask "$svc" 2>/dev/null && log_ok "Mascarado (impede restart): $svc" || true
+done
+
+# ============================================================================
+# CONFIGURAÇÕES ADICIONAIS DE KERNEL
+# ============================================================================
+
+log_info "=== Aplicando parâmetros de kernel para performance ==="
+
+# CPU Idle - desabilita estados C profundos (maior latência de wakeup, mas performance sustentada)
+for cpu in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
+    # Desabilita apenas estados C profundos (state1+), mantém C1
+    state_num=$(basename "$(dirname "$cpu")" | sed 's/state//')
+    if [[ "$state_num" -gt 1 ]] 2>/dev/null; then
+        echo 1 > "$cpu" 2>/dev/null && log_ok "Estado C${state_num} desabilitado: $(dirname "$cpu")" || true
+    fi
+done
+
+# Kernel scheduler - performance
+echo 0 > /proc/sys/kernel/sched_energy_aware 2>/dev/null && log_ok "sched_energy_aware=0" || true
+echo 1 > /proc/sys/kernel/sched_util_clamp_min 2>/dev/null && log_ok "sched_util_clamp_min=1" || true
+
+# Transparent Huge Pages - always para performance
+echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null && log_ok "THP=always" || true
+echo always > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null && log_ok "THP defrag=always" || true
+
+# ============================================================================
+# VERIFICAÇÃO FINAL
+# ============================================================================
+
+log_info "=== Verificação final ==="
+echo ""
+echo "Governors atuais:"
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [[ -f "$cpu" ]] && printf "  %s: %s\n" "$(basename "$(dirname "$(dirname "$cpu")")")" "$(cat "$cpu")"
+done
+
+echo ""
+echo "Frequências (MHz):"
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/; do
+    [[ -f "${cpu}scaling_cur_freq" ]] && printf "  %s: cur=%s min=%s max=%s\n" \
+        "$(basename "$cpu")" \
+        "$(cat "${cpu}scaling_cur_freq" 2>/dev/null || echo "?")" \
+        "$(cat "${cpu}scaling_min_freq" 2>/dev/null || echo "?")" \
+        "$(cat "${cpu}scaling_max_freq" 2>/dev/null || echo "?")"
+done
+
+echo ""
+log_ok "=== Performance mode ativado com sucesso ==="
+log_warn "Nota: Para persistir após reboot, adicione este script ao /etc/rc.local ou crie um systemd service"
+log_warn "Temperaturas subirão - monitore com: watch -n1 sensors"

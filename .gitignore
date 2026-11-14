@@ -1,0 +1,54 @@
+# Outputs gerados (runtime)
+diagnostico_sistema.md
+data/
+benchmarks/*.log
+benchmarks/*.md
+!benchmarks/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+*.egg-info/
+.pytype/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# Build/Dist
+dist/
+build/
+*.egg/
+
+# Shell/Editor temp
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+
+# IDEs/Editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (precaução)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
