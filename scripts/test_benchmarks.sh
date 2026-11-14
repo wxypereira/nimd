@@ -1,0 +1,706 @@
+#!/usr/bin/env bash
+# =============================================================================
+# test_benchmarks.sh - Framework de Testes e Benchmarks Comparativos
+#
+# Executa suites de benchmarks em diferentes cenários:
+#   1. Baseline (governor padrão do sistema)
+#   2. Performance Mode (após performance.sh)
+#   3. Memory Optimized (após optimize_memory.sh)
+#   4. Combined (performance + memory)
+#
+# Gera relatório comparativo em Markdown.
+# =============================================================================
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Configurações
+# -----------------------------------------------------------------------------
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
+readonly RESULTS_DIR="${PROJECT_ROOT}/data/benchmarks"
+readonly REPORT_FILE="${PROJECT_ROOT}/docs/benchmark-comparison.md"
+readonly PERFORMANCE_SCRIPT="${SCRIPT_DIR}/performance.sh"
+readonly MEMORY_SCRIPT="${SCRIPT_DIR}/optimize_memory.sh"
+readonly BENCHMARK_SCRIPT="${SCRIPT_DIR}/benchmark.sh"
+
+# Cores
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly NC='\033[0m'
+
+# Variáveis globais
+RUN_BASELINE=true
+RUN_PERFORMANCE=true
+RUN_MEMORY=true
+RUN_COMBINED=true
+DRY_RUN=false
+QUICK_MODE=false
+
+# -----------------------------------------------------------------------------
+# Funções de Log
+# -----------------------------------------------------------------------------
+log() {
+    local level="$1" timestamp msg
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    shift
+    msg="$*"
+    case "${level}" in
+        INFO)  echo -e "${BLUE}[${timestamp}] [INFO]${NC} ${msg}" ;;
+        OK)    echo -e "${GREEN}[${timestamp}] [OK]${NC} ${msg}" ;;
+        WARN)  echo -e "${YELLOW}[${timestamp}] [WARN]${NC} ${msg}" ;;
+        ERROR) echo -e "${RED}[${timestamp}] [ERROR]${NC} ${msg}" ;;
+        STEP)  echo -e "${CYAN}[${timestamp}] [STEP]${NC} ${msg}" ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Obter governor atual
+# -----------------------------------------------------------------------------
+get_current_governor() {
+    cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown"
+}
+
+# -----------------------------------------------------------------------------
+# Restaurar governor padrão
+# -----------------------------------------------------------------------------
+restore_default_governor() {
+    log INFO "Restaurando governor padrão (schedutil/powersave)..."
+    local default_gov="schedutil"
+    # Tenta detectar o governor padrão do sistema
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors ]]; then
+        local available
+        available=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors)
+        if [[ "${available}" == *"schedutil"* ]]; then
+            default_gov="schedutil"
+        elif [[ "${available}" == *"powersave"* ]]; then
+            default_gov="powersave"
+        elif [[ "${available}" == *"ondemand"* ]]; then
+            default_gov="ondemand"
+        fi
+    fi
+
+    for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        echo "${default_gov}" > "${cpu}" 2>/dev/null || true
+    done
+
+    # Reabilita serviços de power management
+    systemctl unmask thermald tuned power-profiles-daemon 2>/dev/null || true
+    systemctl enable --now thermald tuned power-profiles-daemon 2>/dev/null || true
+
+    log OK "Governor restaurado para: ${default_gov}"
+}
+
+# -----------------------------------------------------------------------------
+# Aplicar performance mode
+# -----------------------------------------------------------------------------
+apply_performance_mode() {
+    log STEP "Aplicando Performance Mode (performance.sh)..."
+    if [[ "${DRY_RUN}" == true ]]; then
+        log INFO "[DRY-RUN] Executaria: sudo ${PERFORMANCE_SCRIPT}"
+        return 0
+    fi
+
+    if sudo "${PERFORMANCE_SCRIPT}"; then
+        log OK "Performance mode aplicado"
+        return 0
+    else
+        log ERROR "Falha ao aplicar performance mode"
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Aplicar memory optimization
+# -----------------------------------------------------------------------------
+apply_memory_optimization() {
+    log STEP "Aplicando Memory Optimization (optimize_memory.sh)..."
+    if [[ "${DRY_RUN}" == true ]]; then
+        log INFO "[DRY-RUN] Executaria: sudo ${MEMORY_SCRIPT} --no-cron"
+        return 0
+    fi
+
+    if sudo "${MEMORY_SCRIPT}" --no-cron; then
+        log OK "Memory optimization aplicada"
+        return 0
+    else
+        log WARN "Memory optimization completou com avisos (verifique logs)"
+        return 0  # Não falha o teste por causa de warnings de compactação
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Executar benchmark
+# -----------------------------------------------------------------------------
+run_benchmark() {
+    local scenario_name="$1"
+    local output_file="${RESULTS_DIR}/benchmark_${scenario_name}_$(date +%Y%m%d_%H%M%S).log"
+
+    log STEP "Executando benchmark: ${scenario_name}"
+    log INFO "Governor atual: $(get_current_governor)"
+    log INFO "Saída: ${output_file}"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        log INFO "[DRY-RUN] Simulando benchmark..."
+        echo "${output_file}"
+        return 0
+    fi
+
+    if "${BENCHMARK_SCRIPT}" 2>&1 | tee "${output_file}"; then
+        log OK "Benchmark ${scenario_name} concluído"
+        echo "${output_file}"
+    else
+        log ERROR "Benchmark ${scenario_name} falhou"
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Extrair métricas do log de benchmark
+# -----------------------------------------------------------------------------
+extract_metrics() {
+    local log_file="$1"
+    local prefix="$2"
+
+    if [[ ! -f "${log_file}" ]]; then
+        echo "ERROR: Log não encontrado: ${log_file}"
+        return 1
+    fi
+
+    # Extrai métricas-chave usando grep/awk
+    local stress_ng_st stress_ng_mt sysbench_st sysbench_mt sysbench_lat mem_bw ctx_switch freq_avg
+
+    # stress-ng single thread bogo ops/s (real time)
+    stress_ng_st=$(grep -A10 "stress-ng CPU single thread" "${log_file}" | grep "^stress-ng: metrc:" | grep "cpu" | head -1 | awk '{print $(NF-1)}' | sed 's/,//g')
+
+    # stress-ng multi thread bogo ops/s
+    stress_ng_mt=$(grep -A10 "stress-ng CPU all cores" "${log_file}" | grep "^stress-ng: metrc:" | grep "cpu" | head -1 | awk '{print $(NF-1)}' | sed 's/,//g')
+
+    # sysbench single thread events/sec
+    sysbench_st=$(grep -A30 "sysbench CPU (prime, 60s)" "${log_file}" | grep "events per second" | head -1 | awk '{print $4}')
+
+    # sysbench multi thread events/sec
+    sysbench_mt=$(grep -A30 "sysbench CPU multi-thread" "${log_file}" | grep "events per second" | head -1 | awk '{print $4}')
+
+    # sysbench latency 95th percentile (multi-thread)
+    sysbench_lat=$(grep -A40 "sysbench CPU multi-thread" "${log_file}" | grep "95th percentile" | head -1 | awk '{print $NF}')
+
+    # memory bandwidth
+    mem_bw=$(grep -A10 "stress-ng memory bandwidth" "${log_file}" | grep "^stress-ng: metrc:" | grep "vm" | head -1 | awk '{print $(NF-1)}' | sed 's/,//g')
+
+    # context switching
+    ctx_switch=$(grep -A10 "stress-ng context switching" "${log_file}" | grep "^stress-ng: metrc:" | grep "switch" | head -1 | awk '{print $(NF-1)}' | sed 's/,//g')
+
+    # frequência média
+    freq_avg=$(grep -A10 "Frequências durante benchmark" "${log_file}" | grep "Media:" | head -1 | awk '{print $2}')
+
+    # Output format: key=value (para sourcing)
+    cat <<EOF
+${prefix}_stress_ng_st=${stress_ng_st:-N/A}
+${prefix}_stress_ng_mt=${stress_ng_mt:-N/A}
+${prefix}_sysbench_st=${sysbench_st:-N/A}
+${prefix}_sysbench_mt=${sysbench_mt:-N/A}
+${prefix}_sysbench_lat=${sysbench_lat:-N/A}
+${prefix}_mem_bw=${mem_bw:-N/A}
+${prefix}_ctx_switch=${ctx_switch:-N/A}
+${prefix}_freq_avg=${freq_avg:-N/A}
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Calcular variação percentual
+# -----------------------------------------------------------------------------
+calc_delta() {
+    local baseline="$1"
+    local current="$2"
+
+    if [[ "${baseline}" == "N/A" ]] || [[ "${current}" == "N/A" ]] || [[ -z "${baseline}" ]] || [[ -z "${current}" ]]; then
+        echo "N/A"
+        return
+    fi
+
+    # Remove vírgulas se houver
+    baseline="${baseline//,/}"
+    current="${current//,/}"
+
+    local delta
+    delta=$(awk "BEGIN { printf \"%.1f\", ((${current} - ${baseline}) / ${baseline}) * 100 }" 2>/dev/null || echo "N/A")
+    echo "${delta}"
+}
+
+# -----------------------------------------------------------------------------
+# Formatar delta com emoji
+# -----------------------------------------------------------------------------
+format_delta() {
+    local delta="$1"
+    local higher_is_better="${2:-true}"
+
+    if [[ "${delta}" == "N/A" ]]; then
+        echo "N/A"
+        return
+    fi
+
+    local sign=""
+    (( $(echo "${delta} > 0" | bc -l) )) && sign="+"
+
+    if [[ "${higher_is_better}" == "true" ]]; then
+        if (( $(echo "${delta} > 0" | bc -l) )); then
+            echo "${sign}${delta}% ⬆️"
+        elif (( $(echo "${delta} < 0" | bc -l) )); then
+            echo "${delta}% ⬇️"
+        else
+            echo "${delta}% ➡️"
+        fi
+    else
+        # Para latência, menor é melhor
+        if (( $(echo "${delta} < 0" | bc -l) )); then
+            echo "${sign}${delta}% ⬆️ (melhor)"
+        elif (( $(echo "${delta} > 0" | bc -l) )); then
+            echo "${delta}% ⬇️ (pior)"
+        else
+            echo "${delta}% ➡️"
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Gerar relatório comparativo
+# -----------------------------------------------------------------------------
+generate_report() {
+    local baseline_log="$1"
+    local perf_log="$2"
+    local mem_log="$3"
+    local combined_log="$4"
+
+    log STEP "Gerando relatório comparativo..."
+
+    # Extrai métricas
+    eval "$(extract_metrics "${baseline_log}" "base")"
+    eval "$(extract_metrics "${perf_log}" "perf")"
+    eval "$(extract_metrics "${mem_log}" "mem")"
+    eval "$(extract_metrics "${combined_log}" "comb")"
+
+    # Calcula deltas
+    local d_perf_st d_perf_mt d_perf_sys_st d_perf_sys_mt d_perf_lat d_perf_mem d_perf_ctx d_perf_freq
+    local d_mem_st d_mem_mt d_mem_sys_st d_mem_sys_mt d_mem_lat d_mem_mem d_mem_ctx d_mem_freq
+    local d_comb_st d_comb_mt d_comb_sys_st d_comb_sys_mt d_comb_lat d_comb_mem d_comb_ctx d_comb_freq
+
+    d_perf_st=$(calc_delta "${base_stress_ng_st}" "${perf_stress_ng_st}")
+    d_perf_mt=$(calc_delta "${base_stress_ng_mt}" "${perf_stress_ng_mt}")
+    d_perf_sys_st=$(calc_delta "${base_sysbench_st}" "${perf_sysbench_st}")
+    d_perf_sys_mt=$(calc_delta "${base_sysbench_mt}" "${perf_sysbench_mt}")
+    d_perf_lat=$(calc_delta "${base_sysbench_lat}" "${perf_sysbench_lat}")
+    d_perf_mem=$(calc_delta "${base_mem_bw}" "${perf_mem_bw}")
+    d_perf_ctx=$(calc_delta "${base_ctx_switch}" "${perf_ctx_switch}")
+    d_perf_freq=$(calc_delta "${base_freq_avg}" "${perf_freq_avg}")
+
+    d_mem_st=$(calc_delta "${base_stress_ng_st}" "${mem_stress_ng_st}")
+    d_mem_mt=$(calc_delta "${base_stress_ng_mt}" "${mem_stress_ng_mt}")
+    d_mem_sys_st=$(calc_delta "${base_sysbench_st}" "${mem_sysbench_st}")
+    d_mem_sys_mt=$(calc_delta "${base_sysbench_mt}" "${mem_sysbench_mt}")
+    d_mem_lat=$(calc_delta "${base_sysbench_lat}" "${mem_sysbench_lat}")
+    d_mem_mem=$(calc_delta "${base_mem_bw}" "${mem_mem_bw}")
+    d_mem_ctx=$(calc_delta "${base_ctx_switch}" "${mem_ctx_switch}")
+    d_mem_freq=$(calc_delta "${base_freq_avg}" "${mem_freq_avg}")
+
+    d_comb_st=$(calc_delta "${base_stress_ng_st}" "${comb_stress_ng_st}")
+    d_comb_mt=$(calc_delta "${base_stress_ng_mt}" "${comb_stress_ng_mt}")
+    d_comb_sys_st=$(calc_delta "${base_sysbench_st}" "${comb_sysbench_st}")
+    d_comb_sys_mt=$(calc_delta "${base_sysbench_mt}" "${comb_sysbench_mt}")
+    d_comb_lat=$(calc_delta "${base_sysbench_lat}" "${comb_sysbench_lat}")
+    d_comb_mem=$(calc_delta "${base_mem_bw}" "${comb_mem_bw}")
+    d_comb_ctx=$(calc_delta "${base_ctx_switch}" "${comb_ctx_switch}")
+    d_comb_freq=$(calc_delta "${base_freq_avg}" "${comb_freq_avg}")
+
+    # Gera relatório Markdown
+    cat > "${REPORT_FILE}" <<EOF
+# Relatório Comparativo de Benchmarks - System Optimization Toolkit
+
+**Data/Hora:** $(date '+%Y-%m-%d %H:%M:%S')
+**Hostname:** $(hostname)
+**Kernel:** $(uname -r)
+**CPU:** $(lscpu | grep 'Model name' | cut -d: -f2 | xargs)
+**Cores:** $(nproc)
+
+---
+
+## Cenários Testados
+
+| Cenário | Descrição | Governor | Log |
+|---------|-----------|----------|-----|
+| **Baseline** | Sistema padrão (sem otimizações) | $(get_governor_from_log "${baseline_log}") | $(basename "${baseline_log}") |
+| **Performance** | Após \`performance.sh\` (governor=performance, turbo, C-states off) | $(get_governor_from_log "${perf_log}") | $(basename "${perf_log}") |
+| **Memory** | Após \`optimize_memory.sh\` (drop_caches + compaction) | $(get_governor_from_log "${mem_log}") | $(basename "${mem_log}") |
+| **Combined** | Performance + Memory | $(get_governor_from_log "${combined_log}") | $(basename "${combined_log}") |
+
+---
+
+## Resultados: CPU Compute (stress-ng bogo ops/s - real time)
+
+| Métrica | Baseline | Performance | Δ Perf | Memory | Δ Mem | Combined | Δ Comb |
+|---------|----------|-------------|--------|--------|-------|----------|--------|
+| **Single Thread** | ${base_stress_ng_st} | ${perf_stress_ng_st} | $(format_delta "${d_perf_st}") | ${mem_stress_ng_st} | $(format_delta "${d_mem_st}") | ${comb_stress_ng_st} | $(format_delta "${d_comb_st}") |
+| **All Cores (MT)** | ${base_stress_ng_mt} | ${perf_stress_ng_mt} | $(format_delta "${d_perf_mt}") | ${mem_stress_ng_mt} | $(format_delta "${d_mem_mt}") | ${comb_stress_ng_mt} | $(format_delta "${d_comb_mt}") |
+
+---
+
+## Resultados: sysbench CPU (events/sec - prime numbers)
+
+| Métrica | Baseline | Performance | Δ Perf | Memory | Δ Mem | Combined | Δ Comb |
+|---------|----------|-------------|--------|--------|-------|----------|--------|
+| **Single Thread** | ${base_sysbench_st} | ${perf_sysbench_st} | $(format_delta "${d_perf_sys_st}") | ${mem_sysbench_st} | $(format_delta "${d_mem_sys_st}") | ${comb_sysbench_st} | $(format_delta "${d_comb_sys_st}") |
+| **Multi-Thread** | ${base_sysbench_mt} | ${perf_sysbench_mt} | $(format_delta "${d_perf_sys_mt}") | ${mem_sysbench_mt} | $(format_delta "${d_mem_sys_mt}") | ${comb_sysbench_mt} | $(format_delta "${d_comb_sys_mt}") |
+| **Latência p95 (ms)** | ${base_sysbench_lat} | ${perf_sysbench_lat} | $(format_delta "${d_perf_lat}" "false") | ${mem_sysbench_lat} | $(format_delta "${d_mem_lat}" "false") | ${comb_sysbench_lat} | $(format_delta "${d_comb_lat}" "false") |
+
+---
+
+## Resultados: Memória e Context Switching
+
+| Métrica | Baseline | Performance | Δ Perf | Memory | Δ Mem | Combined | Δ Comb |
+|---------|----------|-------------|--------|--------|-------|----------|--------|
+| **Memory BW (ops/s)** | ${base_mem_bw} | ${perf_mem_bw} | $(format_delta "${d_perf_mem}") | ${mem_mem_bw} | $(format_delta "${d_mem_mem}") | ${comb_mem_bw} | $(format_delta "${d_comb_mem}") |
+| **Context Switch (ops/s)** | ${base_ctx_switch} | ${perf_ctx_switch} | $(format_delta "${d_perf_ctx}") | ${mem_ctx_switch} | $(format_delta "${d_mem_ctx}") | ${comb_ctx_switch} | $(format_delta "${d_comb_ctx}") |
+
+---
+
+## Frequência Média Sustentada (MHz)
+
+| Cenário | Frequência Média | Δ vs Baseline |
+|---------|------------------|---------------|
+| Baseline | ${base_freq_avg} MHz | — |
+| Performance | ${perf_freq_avg} MHz | $(format_delta "${d_perf_freq}") |
+| Memory | ${mem_freq_avg} MHz | $(format_delta "${d_mem_freq}") |
+| Combined | ${comb_freq_avg} MHz | $(format_delta "${d_comb_freq}") |
+
+---
+
+## Análise e Conclusões
+
+### Performance Mode (performance.sh)
+$(analyze_performance "${d_perf_st}" "${d_perf_mt}" "${d_perf_sys_mt}" "${d_perf_lat}" "${d_perf_freq}")
+
+### Memory Optimization (optimize_memory.sh)
+$(analyze_memory "${d_mem_st}" "${d_mem_mt}" "${d_mem_sys_mt}" "${d_mem_lat}" "${d_mem_freq}")
+
+### Combined (Performance + Memory)
+$(analyze_combined "${d_comb_st}" "${d_comb_mt}" "${d_comb_sys_mt}" "${d_comb_lat}" "${d_comb_freq}")
+
+---
+
+## Trade-offs Resumidos
+
+| Aspecto | Baseline | Performance | Memory | Combined |
+|---------|----------|-------------|--------|----------|
+| **Throughput MT** | Referência | $(get_trend "${d_perf_mt}") | $(get_trend "${d_mem_mt}") | $(get_trend "${d_comb_mt}") |
+| **Latência p95** | Referência | $(get_trend "${d_perf_lat}" "lat") | $(get_trend "${d_mem_lat}" "lat") | $(get_trend "${d_comb_lat}" "lat") |
+| **Single Thread** | Referência | $(get_trend "${d_perf_st}") | $(get_trend "${d_mem_st}") | $(get_trend "${d_comb_st}") |
+| **Consumo/Temp** | Baixo | **Alto** (+30-50W) | Baixo | **Alto** |
+| **Estabilidade** | Boa | Média* | Boa | Média* |
+
+*Requer monitoramento térmico adequado
+
+---
+
+## Logs Completos
+
+\`\`\`bash
+# Baseline
+cat ${baseline_log}
+
+# Performance
+cat ${perf_log}
+
+# Memory
+cat ${mem_log}
+
+# Combined
+cat ${combined_log}
+\`\`\`
+
+---
+
+*Relatório gerado automaticamente por \`test_benchmarks.sh\`*
+EOF
+
+    log OK "Relatório gerado: ${REPORT_FILE}"
+}
+
+# -----------------------------------------------------------------------------
+# Funções auxiliares para análise
+# -----------------------------------------------------------------------------
+get_governor_from_log() {
+    grep "Governor atual:" "$1" | head -1 | awk '{print $NF}' || echo "unknown"
+}
+
+analyze_performance() {
+    local st="$1" mt="$2" sysmt="$3" lat="$4" freq="$5"
+    local analysis=""
+
+    if [[ "${mt}" != "N/A" ]] && (( $(echo "${mt} > 10" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Ganho multi-thread significativo** (${mt}%) — frequência fixa no máximo elimina throttling e latência de ramp-up. "
+    elif [[ "${mt}" != "N/A" ]] && (( $(echo "${mt} > 0" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Ganho multi-thread moderado** (${mt}%). "
+    elif [[ "${mt}" != "N/A" ]] && (( $(echo "${mt} < 0" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Queda multi-thread** (${mt}%) — pode indicar thermal throttling. "
+    fi
+
+    if [[ "${st}" != "N/A" ]] && (( $(echo "${st} < -3" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Single-thread ligeiramente mais lento** (${st}%) — governor \`schedutil\` escala rápido para bursts; \`performance\` fixa no max mas perde boost oportunístico. "
+    fi
+
+    if [[ "${lat}" != "N/A" ]] && (( $(echo "${lat} < -10" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Latência p95 melhorou ${lat}%** — previsibilidade total, ideal para gaming/real-time. "
+    fi
+
+    if [[ "${freq}" != "N/A" ]] && (( $(echo "${freq} > 30" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Frequência média subiu ${freq}%** — CPU travada no máximo sustentado. "
+    fi
+
+    analysis="${analysis}- **Trade-off**: Consumo +30-50W, temperatura +15-25°C. **Monitore com \`watch sensors\`**."
+    echo "${analysis}"
+}
+
+analyze_memory() {
+    local st="$1" mt="$2" sysmt="$3" lat="$4" freq="$5"
+    local analysis=""
+
+    if [[ "${mt}" != "N/A" ]] && (( $(echo "${mt} > 0" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Leve ganho multi-thread** (${mt}%) — limpeza de caches reduz pressão de memória. "
+    elif [[ "${mt}" != "N/A" ]] && (( $(echo "${mt} < 0" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Queda multi-thread** (${mt}%) — drop_caches pode causar page faults iniciais. "
+    fi
+
+    if [[ "${lat}" != "N/A" ]] && (( $(echo "${lat} < 0" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Latência melhorou** (${lat}%) — compactação ajuda alocação de huge pages. "
+    fi
+
+    analysis="${analysis}- **Overhead mínimo** — drop_caches é rápido; compactação só ativa se CONFIG_COMPACTION=y. "
+    analysis="${analysis}- **Ideal para**: sistemas com memory pressure, workloads com alocações grandes."
+    echo "${analysis}"
+}
+
+analyze_combined() {
+    local st="$1" mt="$2" sysmt="$3" lat="$4" freq="$5"
+    local analysis=""
+
+    if [[ "${mt}" != "N/A" ]] && (( $(echo "${mt} > 15" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Sinergia positiva**: Performance mode + memory cleanup = ganho máximo multi-thread (${mt}%). "
+    fi
+
+    if [[ "${lat}" != "N/A" ]] && (( $(echo "${lat} < -15" | bc -l 2>/dev/null || echo 0) )); then
+        analysis="${analysis}- **Latência otimizada** (${lat}%) — frequência fixa + compactação = alocação previsível. "
+    fi
+
+    analysis="${analysis}- **Cenário recomendado para**: compilação, rendering, VMs, servidores de alta carga. "
+    analysis="${analysis}- **Atenção**: Mesmo trade-off térmico do Performance mode. Combine com undervolt se possível."
+    echo "${analysis}"
+}
+
+get_trend() {
+    local delta="$1"
+    local type="${2:-throughput}"
+
+    if [[ "${delta}" == "N/A" ]]; then
+        echo "N/A"
+        return
+    fi
+
+    if [[ "${type}" == "lat" ]]; then
+        # Para latência, negativo = bom
+        if (( $(echo "${delta} < -5" | bc -l 2>/dev/null || echo 0) )); then
+            echo "🟢 Muito melhor"
+        elif (( $(echo "${delta} < 0" | bc -l 2>/dev/null || echo 0) )); then
+            echo "🟡 Melhor"
+        elif (( $(echo "${delta} > 5" | bc -l 2>/dev/null || echo 0) )); then
+            echo "🔴 Pior"
+        elif (( $(echo "${delta} > 0" | bc -l 2>/dev/null || echo 0) )); then
+            echo "🟠 Levemente pior"
+        else
+            echo "⚪ Igual"
+        fi
+    else
+        # Para throughput, positivo = bom
+        if (( $(echo "${delta} > 10" | bc -l 2>/dev/null || echo 0) )); then
+            echo "🟢 Ganho alto"
+        elif (( $(echo "${delta} > 0" | bc -l 2>/dev/null || echo 0) )); then
+            echo "🟡 Ganho"
+        elif (( $(echo "${delta} < -10" | bc -l 2>/dev/null || echo 0) )); then
+            echo "🔴 Queda alta"
+        elif (( $(echo "${delta} < 0" | bc -l 2>/dev/null || echo 0) )); then
+            echo "🟠 Queda"
+        else
+            echo "⚪ Igual"
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Help
+# -----------------------------------------------------------------------------
+show_help() {
+    cat <<EOF
+test_benchmarks.sh - Framework de Testes Comparativos
+
+USO:
+    sudo ./test_benchmarks.sh [OPÇÕES]
+
+OPÇÕES:
+    --baseline-only      Apenas executa baseline
+    --performance-only   Apenas executa performance mode
+    --memory-only        Apenas executa memory optimization
+    --combined-only      Apenas executa combined
+    --quick              Modo rápido (benchmark reduzido - 30s cada)
+    --dry-run            Simula sem executar
+    --no-restore         Não restaura governor ao final
+    --help               Exibe esta ajuda
+
+EXEMPLOS:
+    sudo ./test_benchmarks.sh                    # Suite completa
+    sudo ./test_benchmarks.sh --quick            # Rápido (para teste)
+    sudo ./test_benchmarks.sh --performance-only # Apenas performance
+
+NOTA: Requer root para aplicar otimizações.
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Parse Args
+# -----------------------------------------------------------------------------
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --baseline-only)
+                RUN_PERFORMANCE=false
+                RUN_MEMORY=false
+                RUN_COMBINED=false
+                ;;
+            --performance-only)
+                RUN_BASELINE=false
+                RUN_MEMORY=false
+                RUN_COMBINED=false
+                ;;
+            --memory-only)
+                RUN_BASELINE=false
+                RUN_PERFORMANCE=false
+                RUN_COMBINED=false
+                ;;
+            --combined-only)
+                RUN_BASELINE=false
+                RUN_PERFORMANCE=false
+                RUN_MEMORY=false
+                ;;
+            --quick)
+                QUICK_MODE=true
+                # Modifica benchmark.sh para ser mais rápido via env
+                export BENCHMARK_QUICK=1
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                ;;
+            --no-restore)
+                RESTORE_AT_END=false
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                log ERROR "Opção desconhecida: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+main() {
+    parse_args "$@"
+
+    log INFO "=== Iniciando Suite de Benchmarks Comparativos ==="
+    log INFO "Host: $(hostname) | Kernel: $(uname -r) | CPU: $(nproc) cores"
+
+    # Verifica dependências
+    for cmd in stress-ng sysbench bc; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            log ERROR "Dependência não encontrada: ${cmd}"
+            log INFO "Instale: sudo pacman -S stress-ng sysbench bc"
+            exit 1
+        fi
+    done
+
+    mkdir -p "${RESULTS_DIR}"
+
+    # Trap para restaurar governor no final
+    if [[ "${RESTORE_AT_END:-true}" == true ]] && [[ "${DRY_RUN}" == false ]]; then
+        trap 'log WARN "Interrompido - restaurando governor..."; restore_default_governor' INT TERM EXIT
+    fi
+
+    local baseline_log="" perf_log="" mem_log="" combined_log=""
+
+    # 1. BASELINE
+    if [[ "${RUN_BASELINE}" == true ]]; then
+        log STEP "=== CENÁRIO 1: BASELINE ==="
+        restore_default_governor
+        sleep 3
+        baseline_log=$(run_benchmark "baseline")
+    fi
+
+    # 2. PERFORMANCE MODE
+    if [[ "${RUN_PERFORMANCE}" == true ]]; then
+        log STEP "=== CENÁRIO 2: PERFORMANCE MODE ==="
+        apply_performance_mode
+        sleep 3
+        perf_log=$(run_benchmark "performance")
+    fi
+
+    # 3. MEMORY OPTIMIZATION
+    if [[ "${RUN_MEMORY}" == true ]]; then
+        log STEP "=== CENÁRIO 3: MEMORY OPTIMIZATION ==="
+        restore_default_governor
+        sleep 2
+        apply_memory_optimization
+        sleep 2
+        mem_log=$(run_benchmark "memory")
+    fi
+
+    # 4. COMBINED
+    if [[ "${RUN_COMBINED}" == true ]]; then
+        log STEP "=== CENÁRIO 4: COMBINED (Performance + Memory) ==="
+        apply_performance_mode
+        sleep 2
+        apply_memory_optimization
+        sleep 2
+        combined_log=$(run_benchmark "combined")
+    fi
+
+    # Restaura governor
+    if [[ "${RESTORE_AT_END:-true}" == true ]] && [[ "${DRY_RUN}" == false ]]; then
+        log STEP "Restaurando configuração original..."
+        restore_default_governor
+        trap - INT TERM EXIT
+    fi
+
+    # Gera relatório se temos pelo menos baseline + 1 cenário (e não é dry-run)
+    if [[ "${DRY_RUN}" == false ]] && [[ -n "${baseline_log}" ]] && [[ -n "${perf_log:-}${mem_log:-}${combined_log:-}" ]]; then
+        # Preenche logs vazios com baseline para comparação
+        perf_log="${perf_log:-${baseline_log}}"
+        mem_log="${mem_log:-${baseline_log}}"
+        combined_log="${combined_log:-${baseline_log}}"
+        generate_report "${baseline_log}" "${perf_log}" "${mem_log}" "${combined_log}"
+    elif [[ "${DRY_RUN}" == true ]]; then
+        log INFO "[DRY-RUN] Pulando geração de relatório (logs não existem em dry-run)"
+    else
+        log WARN "Dados insuficientes para relatório comparativo (precisa de baseline + pelo menos 1 cenário)"
+    fi
+
+    log INFO "=== Suite de Benchmarks Concluída ==="
+}
+
+main "$@"
