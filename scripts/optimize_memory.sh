@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# =============================================================================
+# optimize_memory.sh - Otimização de Memória Linux
+#
+# Descrição:
+#   Script para limpeza de caches do kernel (pagecache, dentries, inodes) e
+#   ativação condicional de compactação de memória (se suportado pelo kernel).
+#   Suporta instalação opcional de CronJob para execução periódica.
+#
+# Requisitos:
+#   - Linux com sysctl (procps-ng)
+#   - Privilégios de root
+#   - Kernel com CONFIG_COMPACTION=y (para compactação)
+#
+# Uso:
+#   sudo ./optimize_memory.sh                 # Execução interativa
+#   sudo ./optimize_memory.sh --cron daily    # Instala cron diário (não-interativo)
+#   sudo ./optimize_memory.sh --cron hourly   # Instala cron horário
+#   sudo ./optimize_memory.sh --no-cron       # Executa apenas otimização, sem cron
+#   sudo ./optimize_memory.sh --help          # Exibe ajuda
+#
+# Logs:
+#   Console (sempre) + /var/log/memory_optimizer.log (se gravável)
+#
+# =============================================================================
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Constantes e Configurações
+# -----------------------------------------------------------------------------
+readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
+readonly LOG_FILE="/var/log/memory_optimizer.log"
+readonly CRON_MARKER="# memory_optimizer - managed by optimize_memory.sh"
+readonly SYSCTL_BIN="/usr/bin/sysctl"
+
+# Cores para output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m' # No Color
+
+# Variáveis globais
+CRON_ACTION="interactive"  # interactive, install_daily, install_hourly, skip
+DRY_RUN=false
+VERBOSE=false
+
+# -----------------------------------------------------------------------------
+# Funções de Log e Output
+# -----------------------------------------------------------------------------
+log() {
+    local level="$1"
+    shift
+    local msg="$*"
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    local formatted="[${timestamp}] [${level}] ${msg}"
+
+    # Console output com cores
+    case "${level}" in
+        INFO)  echo -e "${BLUE}${formatted}${NC}" ;;
+        OK)    echo -e "${GREEN}${formatted}${NC}" ;;
+        WARN)  echo -e "${YELLOW}${formatted}${NC}" ;;
+        ERROR) echo -e "${RED}${formatted}${NC}" ;;
+        *)     echo "${formatted}" ;;
+    esac
+
+    # File logging (append, ignore errors if no permission)
+    echo "${formatted}" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+log_info()  { log "INFO"  "$@"; }
+log_ok()    { log "OK"    "$@"; }
+log_warn()  { log "WARN"  "$@"; }
+log_error() { log "ERROR" "$@"; }
+
+# -----------------------------------------------------------------------------
+# Validações Iniciais
+# -----------------------------------------------------------------------------
+check_root() {
+    if [[ ${EUID} -ne 0 ]]; then
+        log_error "Este script deve ser executado como root (use sudo)."
+        exit 1
+    fi
+    log_ok "Executando com privilégios de root."
+}
+
+check_sysctl() {
+    if [[ ! -x "${SYSCTL_BIN}" ]]; then
+        log_error "Comando sysctl não encontrado em ${SYSCTL_BIN}."
+        exit 1
+    fi
+    log_ok "sysctl encontrado: ${SYSCTL_BIN}"
+}
+
+# -----------------------------------------------------------------------------
+# Detecção de Configuração do Kernel (CONFIG_COMPACTION)
+# -----------------------------------------------------------------------------
+get_kernel_config_path() {
+    local config_paths=(
+        "/usr/src/linux/.config"
+        "/boot/config-$(uname -r)"
+        "/lib/modules/$(uname -r)/build/.config"
+        "/proc/config.gz"
+    )
+
+    for path in "${config_paths[@]}"; do
+        if [[ -f "${path}" ]]; then
+            if [[ "${path}" == *.gz ]]; then
+                # /proc/config.gz - precisa de zcat
+                if command -v zcat >/dev/null 2>&1; then
+                    echo "${path}"
+                    return 0
+                fi
+            else
+                echo "${path}"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+check_compaction_support() {
+    local config_path
+    config_path="$(get_kernel_config_path)" || {
+        log_warn "Arquivo de configuração do kernel não encontrado."
+        log_warn "Caminhos verificados: /usr/src/linux/.config, /boot/config-$(uname -r), /lib/modules/$(uname -r)/build/.config, /proc/config.gz"
+        return 1
+    }
+
+    log_info "Verificando CONFIG_COMPACTION em: ${config_path}"
+
+    local compaction_enabled=false
+    if [[ "${config_path}" == *.gz ]]; then
+        if zcat "${config_path}" 2>/dev/null | grep -q '^CONFIG_COMPACTION=y'; then
+            compaction_enabled=true
+        fi
+    else
+        if grep -q '^CONFIG_COMPACTION=y' "${config_path}" 2>/dev/null; then
+            compaction_enabled=true
+        fi
+    fi
+
+    if [[ "${compaction_enabled}" == true ]]; then
+        log_ok "CONFIG_COMPACTION=y detectado - compactação de memória suportada."
+        return 0
+    else
+        log_warn "CONFIG_COMPACTION não está habilitado (y) no kernel atual."
+        log_warn "Compactação de memória não será ativada."
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Ações de Otimização
+# -----------------------------------------------------------------------------
+drop_caches() {
+    log_info "Limpando caches do kernel (pagecache, dentries, inodes)..."
+
+    # Sincroniza buffers de disco antes de limpar
+    sync
+
+    if ${SYSCTL_BIN} -w vm.drop_caches=3 >/dev/null 2>&1; then
+        log_ok "Caches limpos com sucesso (vm.drop_caches=3)."
+        return 0
+    else
+        log_error "Falha ao executar sysctl -w vm.drop_caches=3."
+        return 1
+    fi
+}
+
+enable_compaction() {
+    log_info "Ativando compactação de memória (vm.compaction_memory=1)..."
+
+    if ${SYSCTL_BIN} -w vm.compaction_memory=1 >/dev/null 2>&1; then
+        log_ok "Compactação de memória ativada."
+        return 0
+    else
+        log_warn "Falha ao ativar vm.compaction_memory=1 (pode não ser suportado neste kernel)."
+        return 1
+    fi
+}
+
+# Verifica se compactação já está ativa
+is_compaction_active() {
+    local current
+    current="$(${SYSCTL_BIN} -n vm.compaction_memory 2>/dev/null || echo "0")"
+    [[ "${current}" == "1" ]]
+}
+
+# -----------------------------------------------------------------------------
+# Gerenciamento de CronJob
+# -----------------------------------------------------------------------------
+get_cron_schedule() {
+    case "$1" in
+        daily)   echo "0 3 * * *" ;;      # 03:00 diariamente
+        hourly)  echo "0 * * * *" ;;      # Início de cada hora
+        weekly)  echo "0 3 * * 0" ;;      # Domingo 03:00
+        *)       echo "" ;;
+    esac
+}
+
+cron_entry_exists() {
+    local schedule="$1"
+    local cmd="$2"
+    crontab -l 2>/dev/null | grep -F "${cmd}" | grep -qF "${schedule}"
+    return $?
+}
+
+install_cron_job() {
+    local frequency="$1"
+    local schedule
+    schedule="$(get_cron_schedule "${frequency}")"
+
+    if [[ -z "${schedule}" ]]; then
+        log_error "Frequência inválida para cron: ${frequency}"
+        return 1
+    fi
+
+    local cmd="${SCRIPT_DIR}/${SCRIPT_NAME} --no-cron"
+    local entry="${schedule} ${cmd} ${CRON_MARKER}"
+
+    if cron_entry_exists "${schedule}" "${cmd}"; then
+        log_info "CronJob para '${frequency}' já existe. Pulando."
+        return 0
+    fi
+
+    log_info "Instalando CronJob: ${frequency} (${schedule})"
+
+    # Adiciona ao crontab do root (crontab -l retorna 1 se vazio, então usamos || true)
+    local current_cron
+    current_cron="$(crontab -l 2>/dev/null || true)"
+    printf "%s\n%s\n" "$(echo "${current_cron}" | grep -v "${CRON_MARKER}")" "${entry}" | crontab -
+
+    log_ok "CronJob instalado com sucesso."
+    log_info "Comando agendado: ${cmd}"
+    log_info "Para remover: crontab -l | grep -v '${CRON_MARKER}' | crontab -"
+}
+
+remove_cron_jobs() {
+    log_info "Removendo CronJobs gerenciados por este script..."
+    local current_cron
+    current_cron="$(crontab -l 2>/dev/null || true)"
+    echo "${current_cron}" | grep -v "${CRON_MARKER}" | crontab - || true
+    log_ok "CronJobs removidos."
+}
+
+prompt_cron_interactive() {
+    echo
+    log_info "=== Configuração de Agendamento Automático (Cron) ==="
+    echo "Deseja instalar um CronJob para executar esta otimização periodicamente?"
+    echo
+    echo "  1) Diário (03:00)        - Recomendado para servidores/desktops"
+    echo "  2) Horário (início hora) - Para sistemas sob carga constante"
+    echo "  3) Semanal (Dom 03:00)   - Para uso leve"
+    echo "  4) Não instalar CronJob  - Execução apenas manual"
+    echo
+
+    local choice
+    while true; do
+        read -rp "Escolha [1-4]: " choice
+        case "${choice}" in
+            1) CRON_ACTION="install_daily"; break ;;
+            2) CRON_ACTION="install_hourly"; break ;;
+            3) CRON_ACTION="install_weekly"; break ;;
+            4) CRON_ACTION="skip"; break ;;
+            *) log_warn "Opção inválida. Digite 1, 2, 3 ou 4." ;;
+        esac
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Parse de Argumentos
+# -----------------------------------------------------------------------------
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cron)
+                shift
+                case "${1:-}" in
+                    daily|hourly|weekly)
+                        CRON_ACTION="install_${1}"
+                        ;;
+                    *)
+                        log_error "Frequência inválida para --cron: ${1:-vazio}. Use: daily, hourly, weekly"
+                        exit 1
+                        ;;
+                esac
+                ;;
+            --no-cron)
+                CRON_ACTION="skip"
+                ;;
+            --remove-cron)
+                CRON_ACTION="remove"
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                log_warn "Modo DRY-RUN ativo - nenhuma alteração será aplicada."
+                ;;
+            --verbose|-v)
+                VERBOSE=true
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                log_error "Argumento desconhecido: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+show_help() {
+    cat <<EOF
+${SCRIPT_NAME} - Otimização de Memória Linux
+
+USO:
+    sudo ${SCRIPT_NAME} [OPÇÕES]
+
+OPÇÕES:
+    --cron <freq>       Instala CronJob (daily|hourly|weekly) sem interação
+    --no-cron           Executa otimização apenas uma vez, sem CronJob
+    --remove-cron       Remove CronJobs instalados por este script
+    --dry-run           Simula execução sem aplicar alterações
+    --verbose, -v       Output verboso
+    --help, -h          Exibe esta ajuda
+
+EXEMPLOS:
+    sudo ${SCRIPT_NAME}                    # Interativo
+    sudo ${SCRIPT_NAME} --cron daily       # Instala cron diário
+    sudo ${SCRIPT_NAME} --no-cron          # Apenas limpeza única
+    sudo ${SCRIPT_NAME} --remove-cron      # Remove cron jobs
+    sudo ${SCRIPT_NAME} --dry-run --cron hourly  # Simula cron horário
+
+LOGS:
+    Console + /var/log/memory_optimizer.log
+
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+main() {
+    parse_args "$@"
+
+    log_info "=== Iniciando ${SCRIPT_NAME} ==="
+    log_info "Host: $(hostname) | Kernel: $(uname -r) | User: $(whoami)"
+
+    # Validações
+    check_root
+    check_sysctl
+
+    # 1. Limpeza de caches
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_info "[DRY-RUN] Executaria: ${SYSCTL_BIN} -w vm.drop_caches=3"
+    else
+        drop_caches
+    fi
+
+    # 2. Verificação e ativação de compactação
+    if check_compaction_support; then
+        if is_compaction_active; then
+            log_info "Compactação de memória já está ativa (vm.compaction_memory=1)."
+        else
+            if [[ "${DRY_RUN}" == true ]]; then
+                log_info "[DRY-RUN] Executaria: ${SYSCTL_BIN} -w vm.compaction_memory=1"
+            else
+                enable_compaction || true  # Não falha o script se compactação não puder ser ativada
+            fi
+        fi
+    fi
+
+    # 3. Gerenciamento de CronJob
+    case "${CRON_ACTION}" in
+        install_daily)
+            if [[ "${DRY_RUN}" == true ]]; then
+                log_info "[DRY-RUN] Instalaria CronJob diário"
+            else
+                install_cron_job "daily"
+            fi
+            ;;
+        install_hourly)
+            if [[ "${DRY_RUN}" == true ]]; then
+                log_info "[DRY-RUN] Instalaria CronJob horário"
+            else
+                install_cron_job "hourly"
+            fi
+            ;;
+        install_weekly)
+            if [[ "${DRY_RUN}" == true ]]; then
+                log_info "[DRY-RUN] Instalaria CronJob semanal"
+            else
+                install_cron_job "weekly"
+            fi
+            ;;
+        remove)
+            if [[ "${DRY_RUN}" == true ]]; then
+                log_info "[DRY-RUN] Removeria CronJobs existentes"
+            else
+                remove_cron_jobs
+            fi
+            ;;
+        interactive)
+            if [[ "${DRY_RUN}" == true ]]; then
+                log_info "[DRY-RUN] Perguntaria interativamente sobre CronJob"
+            else
+                prompt_cron_interactive
+                case "${CRON_ACTION}" in
+                    install_daily|install_hourly|install_weekly)
+                        install_cron_job "${CRON_ACTION#install_}"
+                        ;;
+                    skip)
+                        log_info "CronJob não instalado. Execução apenas manual."
+                        ;;
+                esac
+            fi
+            ;;
+        skip)
+            log_info "CronJob ignorado (--no-cron)."
+            ;;
+    esac
+
+    log_info "=== ${SCRIPT_NAME} concluído ==="
+}
+
+# -----------------------------------------------------------------------------
+# Execução
+# -----------------------------------------------------------------------------
+main "$@"
