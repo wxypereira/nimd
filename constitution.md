@@ -19,8 +19,10 @@
 | **Memory** | Limpeza de caches, compactação, cron jobs | **Root / Write** | Bash |
 | **Benchmarks** | Carga de trabalho sintética, medição | **User / Read-only** | Bash + stress-ng + sysbench |
 | **Reporting** | Agregação, análise, geração de Markdown | **User / Read-only** | Bash (awk/sed) |
+| **GUI** | Interface gráfica, orquestração, visualização | **User / Read-only** | JavaScript (Electron) |
 
 > **Regra de Ouro:** Código Python **nunca** toca sysfs/procfs para escrita. Código Bash **nunca** faz lógica complexa de parsing — delega ao Python ou usa awk/sed simples.
+> **GUI:** Comunica-se exclusivamente via `core.sh` (JSON Lines protocol). **Nunca** executa comandos de sistema diretamente.
 
 ### 1.3 Modo Operacional Padrão: **Defensive by Default**
 - Todo script perigoso requer `--dry-run` funcional e avisos visuais.
@@ -90,11 +92,23 @@ system-optimization/
 │   │   ├── hardware.sh      ← Detecção CPU/GPU/RAM unificada
 │   │   └── thermal.sh       ← Monitoramento térmico + alerts
 │   │
+│   ├── core.sh              ← CLI unificado JSON Lines (backend para GUI)
 │   ├── performance.sh       ← Tuning CPU (governor, turbo, C-states, scheduler, THP)
 │   ├── optimize_memory.sh   ← Memory (drop_caches, compaction, cron)
 │   ├── benchmark.sh         ← Suite única (stress-ng + sysbench)
 │   ├── test_benchmarks.sh   ← Suite comparativa automatizada
 │   └── generate_comparison_report.sh  ← Agregador de logs → Markdown
+│
+├── gui-electron/            ← GUI Electron (versionado, source only)
+│   ├── main.js              # Main process — janela, menu, IPC, backend spawn
+│   ├── preload.js           # Preload script — contextBridge seguro
+│   ├── package.json         # Deps: electron, electron-store
+│   ├── assets/
+│   │   └── icon.png         # Ícone da aplicação
+│   └── renderer/
+│       ├── index.html       # UI com 5 tabs (Audit, Tune, Bench, Memory, Logs)
+│       ├── styles.css       # Tema dark, responsivo
+│       └── app.js           # Renderer logic — tabs, IPC listeners, state
 │
 ├── docs/
 │   ├── PRD.md               ← Product Requirements (auditoria)
@@ -115,6 +129,7 @@ system-optimization/
 ```
 
 > **Regra:** Nenhum arquivo solto na raiz além dos listados. Novos diretórios só com RFC aprovado.
+> **GUI:** `gui-electron/` é a única GUI oficial. `gui/` (Rust/egui) foi removido por falha de compilação no hardware alvo (LLVM SIGSEGV). Artefatos de build (`node_modules/`, `dist/`) em `.gitignore`.
 
 ---
 
@@ -261,7 +276,7 @@ dry_run_check() { [[ "${DRY_RUN:-false}" == "true" ]] && log_warn "DRY-RUN: $*";
 ### 6.2 Desenvolvimento (Local)
 
 ```toml
-# pyproject.toml — fonte da verdade
+# pyproject.toml — fonte da verdade (Python)
 [project]
 requires-python = ">=3.11"
 dependencies = []  # Zero deps runtime para auditor
@@ -278,6 +293,22 @@ warn_unused_ignores = true
 # shellcheck shell=bash
 # exclude=SC2034,SC2155  # aceitáveis no projeto
 ```
+
+```json
+// gui-electron/package.json — fonte da verdade (GUI)
+{
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3",
+    "eslint": "^8.57.0"
+  },
+  "dependencies": {
+    "electron-store": "^10.0.0"
+  }
+}
+```
+
+> **Regra GUI:** Zero dependências nativas (no `node-gyp`, no C++ addons). Apenas JS/TS puro para build universal.
 
 ### 6.3 Proibido Adicionar Sem RFC
 - Qualquer dependência Python (requests, click, rich, etc.)
@@ -358,6 +389,8 @@ tune_cpu_governor() {
 | Novo cenário de teste | Adicionar case em `test_benchmarks.sh` + flag `--novo-only` |
 | Nova métrica no relatório | Estender `generate_comparison_report.sh` + parser correspondente |
 | Novo governor/tuning | Função em `scripts/lib/hardware.sh` + chamada em `performance.sh` |
+| Nova tab na GUI | Criar componente em `gui-electron/renderer/` + registrar em `app.js` + entry no `index.html` |
+| Novo comando backend | Adicionar case em `core.sh` + evento JSON Lines correspondente |
 
 ---
 

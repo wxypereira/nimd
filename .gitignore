@@ -48,6 +48,11 @@ Thumbs.db
 gui/target/
 **/target/
 
+# Electron build artifacts
+gui-electron/node_modules/
+gui-electron/dist/
+gui-electron/*.log
+
 # Secrets (precaução)
 .env
 .env.*
