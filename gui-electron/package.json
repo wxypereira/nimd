@@ -1,0 +1,46 @@
+{
+  "name": "sysopt-gui",
+  "version": "1.0.0",
+  "description": "System Optimization Toolkit - Electron GUI",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "electron-builder",
+    "lint": "eslint ."
+  },
+  "author": "pereira",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3",
+    "eslint": "^8.57.0"
+  },
+  "dependencies": {
+    "electron-store": "^10.0.0"
+  },
+  "build": {
+    "appId": "com.system-optimization.sysopt",
+    "productName": "System Optimization Toolkit",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "System",
+      "icon": "assets/icon.png"
+    }
+  },
+  "allowScripts": {
+    "electron@30.5.1": true
+  }
+}

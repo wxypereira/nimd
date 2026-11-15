@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>System Optimization Toolkit</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Header / Menu Bar -->
+    <header class="header">
+      <div class="header-left">
+        <h1 class="app-title">⚙️ System Optimization Toolkit</h1>
+      </div>
+      <div class="header-center">
+        <div class="tab-bar" id="tab-bar"></div>
+      </div>
+      <div class="header-right">
+        <div class="core-status" id="core-status">
+          <span class="status-indicator" id="status-indicator"></span>
+          <span id="status-text">Verificando core.sh...</span>
+        </div>
+        <div class="system-monitor" id="system-monitor">
+          CPU: --% | RAM: --/-- MB
+        </div>
+      </div>
+    </header>
+
+    <!-- Progress Bar (global) -->
+    <div class="progress-container" id="progress-container" style="display: none;">
+      <div class="progress-bar">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <div class="progress-info" id="progress-info"></div>
+    </div>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+      <!-- Tab: Auditoria -->
+      <section class="tab-panel" id="tab-audit" data-tab="0">
+        <div class="panel-header">
+          <h2>🔍 Auditoria do Sistema</h2>
+          <div class="panel-actions">
+            <button class="btn btn-primary" id="btn-audit-run" disabled>▶ Executar Auditoria</button>
+            <label class="checkbox-label">
+              <input type="checkbox" id="audit-show-json"> Mostrar JSON bruto
+            </label>
+          </div>
+        </div>
+        <div class="panel-content" id="audit-content">
+          <div class="empty-state">Clique em "Executar Auditoria" para iniciar</div>
+        </div>
+      </section>
+
+      <!-- Tab: Tuning -->
+      <section class="tab-panel" id="tab-tune" data-tab="1" style="display: none;">
+        <div class="panel-header">
+          <h2>⚡ Tuning de Performance</h2>
+          <div class="panel-actions">
+            <div class="tune-options">
+              <label class="checkbox-label">
+                <input type="checkbox" id="tune-dry-run" checked> Dry-run
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="tune-apply"> Aplicar
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="tune-restore"> Restaurar
+              </label>
+            </div>
+            <button class="btn btn-primary" id="btn-tune-run" disabled>▶ Executar Tuning</button>
+          </div>
+        </div>
+        <div class="panel-content" id="tune-content">
+          <div class="tune-options-grid">
+            <div class="option-card">
+              <h3>Governor CPU</h3>
+              <select id="tune-governor" class="form-select">
+                <option value="performance">Performance</option>
+                <option value="powersave">Powersave</option>
+                <option value="schedutil">Schedutil (padrão)</option>
+                <option value="ondemand">Ondemand</option>
+                <option value="conservative">Conservative</option>
+              </select>
+            </div>
+            <div class="option-card">
+              <h3>C-States</h3>
+              <select id="tune-cstates" class="form-select">
+                <option value="disable">Desabilitar (performance)</option>
+                <option value="enable">Habilitar (economia)</option>
+              </select>
+            </div>
+            <div class="option-card">
+              <h3>Transparent Huge Pages</h3>
+              <select id="tune-thp" class="form-select">
+                <option value="always">Always</option>
+                <option value="madvise">Madvise</option>
+                <option value="never">Never</option>
+              </select>
+            </div>
+            <div class="option-card">
+              <h3>Scheduler</h3>
+              <label class="checkbox-label"><input type="checkbox" id="tune-sched-latency" checked> Latency: 1ms</label>
+              <label class="checkbox-label"><input type="checkbox" id="tune-sched-mig-cost" checked> Mig cost: 5ms</label>
+            </div>
+            <div class="option-card">
+              <h3>IRQ Balance</h3>
+              <label class="checkbox-label"><input type="checkbox" id="tune-irqbalance" checked> Mask IRQ balance</label>
+            </div>
+            <div class="option-card warning-card">
+              <h3>⚠️ Serviços de Energia</h3>
+              <label class="checkbox-label"><input type="checkbox" id="tune-mask-thermald">Mask thermald</label>
+              <label class="checkbox-label"><input type="checkbox" id="tune-mask-tuned">Mask tuned</label>
+              <label class="checkbox-label"><input type="checkbox" id="tune-mask-ppd">Mask power-profiles-daemon</label>
+              <p class="warning-text">Desabilita gerenciamento térmico automático. MONITORE TEMPERATURAS!</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab: Benchmark -->
+      <section class="tab-panel" id="tab-bench" data-tab="2" style="display: none;">
+        <div class="panel-header">
+          <h2>📊 Benchmark</h2>
+          <div class="panel-actions">
+            <label class="checkbox-label">
+              <input type="checkbox" id="bench-quick" checked> Quick mode
+            </label>
+            <input type="text" id="bench-output" class="form-input" placeholder="Caminho do output (opcional)">
+            <button class="btn btn-primary" id="btn-bench-run" disabled>▶ Executar Benchmark</button>
+            <button class="btn btn-secondary" id="btn-bench-suite">📋 Suite Completa</button>
+            <button class="btn btn-secondary" id="btn-bench-report">📄 Gerar Relatório</button>
+          </div>
+        </div>
+        <div class="panel-content" id="bench-content">
+          <div class="empty-state">Configure e execute um benchmark</div>
+          <div class="bench-results" id="bench-results" style="display: none;"></div>
+        </div>
+      </section>
+
+      <!-- Tab: Memória -->
+      <section class="tab-panel" id="tab-memory" data-tab="3" style="display: none;">
+        <div class="panel-header">
+          <h2>🧠 Otimização de Memória</h2>
+          <div class="panel-actions">
+            <label class="checkbox-label">
+              <input type="checkbox" id="mem-dry-run" checked> Dry-run
+            </label>
+            <select id="mem-cron" class="form-select">
+              <option value="none">Sem cron</option>
+              <option value="hourly">Horário</option>
+              <option value="daily" selected>Diário (03:00)</option>
+              <option value="weekly">Semanal</option>
+              <option value="remove">Remover cron</option>
+            </select>
+            <button class="btn btn-primary" id="btn-mem-run" disabled>▶ Executar</button>
+          </div>
+        </div>
+        <div class="panel-content" id="mem-content">
+          <div class="mem-options">
+            <div class="option-card">
+              <h3>Ações</h3>
+              <label class="checkbox-label"><input type="checkbox" id="mem-drop-caches" checked> Drop caches (sync + echo 3)</label>
+              <label class="checkbox-label"><input type="checkbox" id="mem-compaction" checked> Compactação de memória</label>
+              <label class="checkbox-label"><input type="checkbox" id="mem-swap" checked> Swap off/on (se swap livre)</label>
+            </div>
+            <div class="option-card">
+              <h3>Verificações</h3>
+              <label class="checkbox-label"><input type="checkbox" id="mem-check-compaction" checked> Verificar CONFIG_COMPACTION</label>
+              <label class="checkbox-label"><input type="checkbox" id="mem-check-hugepages" checked> Verificar Huge Pages</label>
+            </div>
+            <div class="warning-card">
+              <h3>⚠️ Avisos</h3>
+              <ul>
+                <li>drop_causes=3 causa spike de latência se houver muita dirty memory</li>
+                <li>Não use em bancos de dados sensíveis a latência (PostgreSQL, Redis) sem teste prévio</li>
+                <li>Cron diário às 03:00 assume janela de baixa carga</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab: Logs -->
+      <section class="tab-panel" id="tab-logs" data-tab="4" style="display: none;">
+        <div class="panel-header">
+          <h2>📋 Logs</h2>
+          <div class="panel-actions">
+            <div class="log-filters">
+              <label><input type="checkbox" class="log-filter" data-level="info" checked> Info</label>
+              <label><input type="checkbox" class="log-filter" data-level="warn" checked> Warn</label>
+              <label><input type="checkbox" class="log-filter" data-level="error" checked> Error</label>
+              <label><input type="checkbox" class="log-filter" data-level="debug" checked> Debug</label>
+              <label><input type="checkbox" class="log-filter" data-level="success" checked> Success</label>
+              <label><input type="checkbox" class="log-filter" data-level="progress" checked> Progress</label>
+            </div>
+            <div class="log-filters">
+              <label><input type="checkbox" class="log-filter" data-source="gui" checked> GUI</label>
+              <label><input type="checkbox" class="log-filter" data-source="backend-stdout" checked> Backend stdout</label>
+              <label><input type="checkbox" class="log-filter" data-source="backend-stderr" checked> Backend stderr</label>
+            </div>
+            <label class="checkbox-label">
+              <input type="checkbox" id="log-auto-scroll" checked> Auto-scroll
+            </label>
+            <button class="btn btn-secondary" id="btn-logs-clear">🗑️ Limpar</button>
+            <button class="btn btn-secondary" id="btn-logs-export">📤 Exportar</button>
+          </div>
+        </div>
+        <div class="panel-content">
+          <table class="log-table" id="log-table">
+            <thead>
+              <tr>
+                <th>Hora</th>
+                <th>Nível</th>
+                <th>Fonte</th>
+                <th>Mensagem</th>
+              </tr>
+            </thead>
+            <tbody id="log-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <!-- Status Bar -->
+    <footer class="status-bar">
+      <div class="status-left" id="status-left">Pronto</div>
+      <div class="status-right">
+        <span id="footer-cpu">CPU: --%</span>
+        <span id="footer-ram">RAM: --/-- MB</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
