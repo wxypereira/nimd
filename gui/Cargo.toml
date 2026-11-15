@@ -1,0 +1,70 @@
+[package]
+name = "sysopt-gui"
+version = "2.0.0"
+edition = "2021"
+description = "GUI for System Optimization Toolkit (egui/eframe)"
+license = "MIT"
+repository = "https://github.com/wxypereira/nimd"
+authors = ["pereira <wxypereira@domain>"]
+categories = ["gui", "system-tools", "command-line-utilities"]
+keywords = ["egui", "eframe", "system-optimization", "benchmark", "linux"]
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+# GUI Framework
+eframe = { version = "0.29", features = ["persistence", "wgpu", "default_fonts"] }
+egui = { version = "0.29", features = ["default_fonts"] }
+egui_extras = "0.29"
+
+# Async Runtime
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "process", "signal", "io-util", "time"] }
+
+# Process Management
+async-process = "1.8"
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Channels
+crossbeam-channel = "0.5"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# simd-json = "0.10"  # Requires SIMD CPU, not available on i5-3470S
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "1.0"
+dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }
+color-eyre = "0.6"
+opener = "0.7"
+rfd = "0.13"
+image = "0.25"
+sysinfo = "0.30"
+
+[build-dependencies]
+vergen = "10"
+embed-resource = { version = "3", optional = true }
+
+[features]
+default = ["persistence"]
+persistence = ["eframe/persistence"]
+wayland = ["eframe/wayland"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true

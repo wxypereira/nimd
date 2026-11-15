@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# common.sh — Funções compartilhadas para scripts do System Optimization Toolkit
+
+# ========== CORES ==========
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly MAGENTA='\033[0;35m'
+readonly CYAN='\033[0;36m'
+readonly WHITE='\033[1;37m'
+readonly GRAY='\033[0;90m'
+readonly NC='\033[0m' # No Color
+
+# ========== LOGGING ==========
+log_debug() { [[ "${VERBOSE:-false}" == true ]] && echo -e "${GRAY}[DEBUG]${NC} $*" >&2; }
+log_info()  { [[ "${QUIET:-false}" != true ]] && echo -e "${BLUE}[INFO]${NC} $*" >&2; }
+log_ok()    { [[ "${QUIET:-false}" != true ]] && echo -e "${GREEN}[OK]${NC} $*" >&2; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+log_err()   { echo -e "${RED}[ERR]${NC} $*" >&2; }
+log_step()  { [[ "${QUIET:-false}" != true ]] && echo -e "${MAGENTA}[STEP]${NC} $*" >&2; }
+
+# ========== VALIDAÇÕES ==========
+root_check() {
+    if [[ $EUID -ne 0 ]]; then
+        log_err "Este comando requer privilégios de root (sudo)"
+        return 1
+    fi
+    return 0
+}
+
+require_cmd() {
+    local cmd="$1"
+    local pkg="${2:-$1}"
+    if ! command -v "$cmd" &>/dev/null; then
+        log_err "Comando '$cmd' não encontrado. Instale: $pkg"
+        return 1
+    fi
+    return 0
+}
+
+dry_run_check() {
+    [[ "${DRY_RUN:-false}" == true ]] && log_warn "DRY-RUN: $*"
+}
+
+# ========== UTILITÁRIOS ==========
+run_cmd() {
+    local cmd=("$@")
+    local timeout="${CMD_TIMEOUT:-30}"
+    local output
+    
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+        log_warn "DRY-RUN: ${cmd[*]}"
+        return 0
+    fi
+    
+    if output=$(timeout "$timeout" "${cmd[@]}" 2>&1); then
+        printf '%s\n' "$output"
+        return 0
+    else
+        local exit_code=$?
+        if [[ $exit_code -eq 124 ]]; then
+            log_err "Timeout (${timeout}s): ${cmd[*]}"
+        else
+            log_err "Falha (exit $exit_code): ${cmd[*]}"
+            printf '%s\n' "$output" >&2
+        fi
+        return $exit_code
+    fi
+}
+
+# ========== TEMPORÁRIOS ==========
+make_temp_dir() {
+    mktemp -d -t sysopt.XXXXXX
+}
+
+cleanup_temp() {
+    local dir="$1"
+    [[ -d "$dir" ]] && rm -rf "$dir"
+}
+
+# ========== JSON HELPERS ==========
+# Converte array bash para JSON array
+array_to_json() {
+    local arr=("$@")
+    printf '%s\n' "${arr[@]}" | jq -R . | jq -s .
+}
+
+# Extrai valor de JSON (requer jq)
+json_get() {
+    local json="$1" key="$2"
+    echo "$json" | jq -r ".$key // empty"
+}
+
+# ========== SISTEMA ==========
+get_current_governor() {
+    local gov_path="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+    [[ -r "$gov_path" ]] && cat "$gov_path" || echo "unknown"
+}
+
+get_cpu_count() {
+    nproc
+}
+
+get_total_memory_mb() {
+    free -m | awk '/^Mem:/ {print $2}'
+}
+
+get_available_memory_mb() {
+    free -m | awk '/^Mem:/ {print $7}'
+}
+
+# ========== ARQUIVOS ==========
+ensure_dir() {
+    local dir="$1"
+    [[ -d "$dir" ]] || mkdir -p "$dir"
+}
+
+# ========== TEMPO ==========
+timestamp_ms() {
+    date +%s%3N
+}
+
+timestamp_iso() {
+    date -Iseconds
+}
+
+duration_ms() {
+    local start="$1" end="$2"
+    echo $((end - start))
+}
+
+# ========== TRAP HANDLERS ==========
+setup_traps() {
+    local cleanup_func="${1:-cleanup_temp}"
+    trap 'log_warn "Interrompido"; '"$cleanup_func"'; exit 130' INT TERM
+}
+
+# ========== EXPORTS ==========
+export -f log_debug log_info log_ok log_warn log_err log_step
+export -f root_check require_cmd dry_run_check run_cmd
+export -f make_temp_dir cleanup_temp array_to_json json_get
+export -f get_current_governor get_cpu_count get_total_memory_mb get_available_memory_mb
+export -f ensure_dir timestamp_ms timestamp_iso duration_ms setup_traps

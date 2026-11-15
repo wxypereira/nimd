@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# hardware.sh — Detecção unificada de hardware (CPU, GPU, RAM, Motherboard)
+
+# ========== CPU ==========
+audit_hardware_cpu() {
+    local json="{}"
+    
+    # lscpu JSON
+    if command -v lscpu &>/dev/null; then
+        local lscpu_json
+        lscpu_json=$(lscpu -J 2>/dev/null) || lscpu_json="{}"
+        
+        # Normaliza campos (lscpu pode vir em PT-BR)
+        json=$(echo "$lscpu_json" | jq '
+            .lscpu // [] | map({
+                (.field | rtrimstr(":") | gsub(" "; "_") | lower): .data
+            }) | add // {}
+        ')
+    fi
+    
+    # /proc/cpuinfo para flags e detalhes extras
+    if [[ -r /proc/cpuinfo ]]; then
+        local flags model_name vendor_id
+        flags=$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2- | xargs)
+        model_name=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | xargs)
+        vendor_id=$(grep -m1 '^vendor_id' /proc/cpuinfo | cut -d: -f2- | xargs)
+        
+        json=$(echo "$json" | jq \
+            --arg flags "$flags" \
+            --arg model_name "$model_name" \
+            --arg vendor_id "$vendor_id" \
+            '. + {flags: $flags, model_name_raw: $model_name, vendor_id_raw: $vendor_id}')
+    fi
+    
+    # Frequências atuais
+    local freq_json="{}"
+    for cpu in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
+        [[ -r "$cpu" ]] || continue
+        local cpu_num freq
+        cpu_num=$(echo "$cpu" | grep -oP 'cpu\K[0-9]+')
+        freq=$(cat "$cpu" 2>/dev/null)
+        [[ -n "$freq" ]] && freq_json=$(echo "$freq_json" | jq --arg k "cpu$cpu_num" --arg v "$freq" '. + {($k): ($v|tonumber)}')
+    done
+    json=$(echo "$json" | jq --argjson freq "$freq_json" '. + {current_frequencies_khz: $freq}')
+    
+    # Governor atual
+    local gov
+    gov=$(get_current_governor)
+    json=$(echo "$json" | jq --arg gov "$gov" '. + {governor: $gov}')
+    
+    echo "$json"
+}
+
+# Verifica se CPU suporta overclock (Intel K/X series, AMD Ryzen)
+cpu_supports_oc() {
+    local json="$1"
+    local model flags vendor
+    model=$(echo "$json" | jq -r '.model_name_raw // .model_name // ""' | lower)
+    flags=$(echo "$json" | jq -r '.flags // ""' | lower)
+    vendor=$(echo "$json" | jq -r '.vendor_id_raw // .vendor_id // ""' | lower)
+    
+    if [[ "$vendor" == "genuineintel" ]]; then
+        # Intel: K ou X no final do modelo, ou unlocked multiplier
+        if [[ "$model" =~ [kx]$ ]] || [[ "$flags" == *"unlocked"* ]]; then
+            echo "true"
+            return
+        fi
+    elif [[ "$vendor" == "authenticamd" ]]; then
+        # AMD: Ryzen/Threadripper/EPYC são unlocked por padrão
+        if [[ "$model" == *"ryzen"* ]] || [[ "$model" == *"threadripper"* ]] || [[ "$model" == *"epyc"* ]]; then
+            echo "true"
+            return
+        fi
+    fi
+    echo "false"
+}
+
+# ========== GPU ==========
+audit_hardware_gpu() {
+    local gpus=()
+    
+    if command -v lspci &>/dev/null; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && gpus+=("$line")
+        done < <(lspci -nn | grep -E '(VGA|3D|Display)')
+    fi
+    
+    # Informações adicionais via glxinfo se disponível
+    if command -v glxinfo &>/dev/null; then
+        local renderer
+        renderer=$(glxinfo -B 2>/dev/null | grep -i 'opengl renderer' | head -1 | cut -d: -f2- | xargs)
+        [[ -n "$renderer" ]] && gpus+=("OpenGL Renderer: $renderer")
+    fi
+    
+    printf '%s\n' "${gpus[@]}" | jq -R . | jq -s .
+}
+
+# ========== RAM ==========
+audit_hardware_ram() {
+    local json="{}"
+    
+    # free -h para resumo
+    local free_output
+    free_output=$(free -h 2>/dev/null)
+    json=$(echo "$json" | jq --arg free "$free_output" '. + {summary: $free}')
+    
+    # dmidecode para detalhes (requer root para completo)
+    local dimm_info=""
+    if command -v dmidecode &>/dev/null; then
+        dimm_info=$(dmidecode -t memory 2>/dev/null | head -100)
+    fi
+    json=$(echo "$json" | jq --arg dimm "$dimm_info" '. + {details: $dimm}')
+    
+    # /proc/meminfo para detalhes técnicos
+    if [[ -r /proc/meminfo ]]; then
+        local meminfo_json="{}"
+        while IFS=':' read -r key value; do
+            key=$(echo "$key" | tr ' ' '_' | lower)
+            value=$(echo "$value" | xargs)
+            meminfo_json=$(echo "$meminfo_json" | jq --arg k "$key" --arg v "$value" '. + {($k): $v}')
+        done < /proc/meminfo
+        json=$(echo "$json" | jq --argjson meminfo "$meminfo_json" '. + {meminfo: $meminfo}')
+    fi
+    
+    echo "$json"
+}
+
+# ========== THERMAL ==========
+audit_hardware_thermal() {
+    local json="{}"
+    local core_temps=()
+    local zone_temps=()
+    local sensors_output=""
+    
+    # sensors (lm_sensors)
+    if command -v sensors &>/dev/null; then
+        sensors_output=$(sensors 2>/dev/null)
+        
+        # Extrai temperaturas de cores
+        while IFS= read -r line; do
+            if [[ "$line" =~ (Core|Package).*\+?([0-9]+\.?[0-9]*)°C ]]; then
+                core_temps+=("${BASH_REMATCH[2]}")
+            fi
+        done <<< "$sensors_output"
+    fi
+    
+    # Zonas térmicas do kernel
+    for zone in /sys/class/thermal/thermal_zone*/temp; do
+        [[ -r "$zone" ]] || continue
+        local temp
+        temp=$(cat "$zone" 2>/dev/null)
+        if [[ "$temp" =~ ^[0-9]+$ ]]; then
+            zone_temps+=("$((temp / 1000))")
+        fi
+    done
+    
+    # Fan speeds
+    local fans=()
+    for fan in /sys/class/hwmon/hwmon*/fan*_input; do
+        [[ -r "$fan" ]] || continue
+        local rpm
+        rpm=$(cat "$fan" 2>/dev/null)
+        [[ -n "$rpm" ]] && fans+=("$rpm RPM")
+    done
+    
+    json=$(echo "$json" | jq -n \
+        --argjson core_temps "$(printf '%s\n' "${core_temps[@]}" | jq -R . | jq -s 'map(tonumber)')" \
+        --argjson zone_temps "$(printf '%s\n' "${zone_temps[@]}" | jq -R . | jq -s 'map(tonumber)')" \
+        --argjson fans "$(printf '%s\n' "${fans[@]}" | jq -R . | jq -s .)" \
+        --arg sensors_raw "$sensors_output" \
+        '{
+            core_temps_c: $core_temps,
+            zone_temps_c: $zone_temps,
+            fans: $fans,
+            sensors_raw: $sensors_raw,
+            max_core_temp: ($core_temps | max // 0),
+            avg_core_temp: (if $core_temps | length > 0 then ($core_temps | add / length) else 0 end)
+        }')
+    
+    echo "$json"
+}
+
+# ========== MOTHERBOARD/BIOS ==========
+audit_hardware_motherboard() {
+    local json="{}"
+    
+    if command -v dmidecode &>/dev/null; then
+        local vendor product version
+        vendor=$(dmidecode -s baseboard-manufacturer 2>/dev/null | xargs)
+        product=$(dmidecode -s baseboard-product-name 2>/dev/null | xargs)
+        version=$(dmidecode -s baseboard-version 2>/dev/null | xargs)
+        
+        json=$(echo "$json" | jq \
+            --arg vendor "$vendor" \
+            --arg product "$product" \
+            --arg version "$version" \
+            '. + {vendor: $vendor, product: $product, version: $version}')
+    fi
+    
+    # BIOS info
+    if command -v dmidecode &>/dev/null; then
+        local bios_vendor bios_version bios_date
+        bios_vendor=$(dmidecode -s bios-vendor 2>/dev/null | xargs)
+        bios_version=$(dmidecode -s bios-version 2>/dev/null | xargs)
+        bios_date=$(dmidecode -s bios-release-date 2>/dev/null | xargs)
+        
+        json=$(echo "$json" | jq \
+            --arg vendor "$bios_vendor" \
+            --arg version "$bios_version" \
+            --arg date "$bios_date" \
+            '. + {bios_vendor: $vendor, bios_version: $version, bios_date: $date}')
+    fi
+    
+    echo "$json"
+}
+
+# ========== KERNEL CONFIG ==========
+kernel_config_path() {
+    # Tenta múltiplos locais
+    local paths=(
+        "/proc/config.gz"
+        "/boot/config-$(uname -r)"
+        "/usr/src/linux/.config"
+        "/lib/modules/$(uname -r)/build/.config"
+    )
+    
+    for path in "${paths[@]}"; do
+        if [[ -f "$path" ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+kernel_has_config() {
+    local config="$1"
+    local path
+    path=$(kernel_config_path) || return 1
+    
+    if [[ "$path" == *.gz ]]; then
+        zgrep -q "^${config}=y$" "$path"
+    else
+        grep -q "^${config}=y$" "$path"
+    fi
+}
+
+# Export functions
+export -f audit_hardware_cpu cpu_supports_oc audit_hardware_gpu audit_hardware_ram audit_hardware_thermal audit_hardware_motherboard kernel_config_path kernel_has_config

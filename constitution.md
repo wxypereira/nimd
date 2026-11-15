@@ -414,11 +414,58 @@ CONSTITUTION_VERSION = "1.0.0"  # MAJOR: quebra workflow | MINOR: nova regra | P
 
 ---
 
+## 11. MEMÓRIA PERSISTENTE OBRIGATÓRIA (mem.md)
+
+### 11.1 Regra Fundamental
+> **Toda alteração no projeto — código, docs, scripts, configs, arquitetura — DEVE ser registrada no `mem.md` no mesmo commit/PR.**
+
+### 11.2 O que Registrar
+| Tipo de Mudança | Entrada em mem.md |
+|-----------------|-------------------|
+| **Bugfix** | Bug #N, sintoma, causa raiz, fix aplicado, arquivo(s), status |
+| **Feature** | O que foi adicionado, arquivos, flags/comandos novos, como testar |
+| **Refatoração** | O que mudou, por quê, impacto (zero comportamental esperado) |
+| **Breaking Change** | RFC link, migração necessária, version bump (MAJOR) |
+| **Docs** | Seção atualizada, razão, link para PR/issue |
+| **Benchmark/Resultado** | Data, cenário, métricas, delta vs baseline, log path |
+| **Config/Tooling** | Ferramenta, versão, flag, impacto no build/test |
+
+### 11.3 Formato de Entrada (Obrigatório)
+```markdown
+### YYYY-MM-DD — Título Curto
+
+#### Componente: `caminho/arquivo.ext`
+**Tipo:** bugfix | feat | refactor | breaking | docs | benchmark | config
+**Descrição:** Uma linha resumindo a mudança.
+**Arquivos:** `arquivo1`, `arquivo2`...
+**Como testar:** Comando(s) para validar.
+**Status:** ✅ Done | 📋 Planned | ⚠️ Known Issue
+```
+
+### 11.4 Validação no Pre-Commit (Obrigatório)
+Adicionar ao checklist da Seção 9:
+```bash
+□ grep -q "$(date +%Y-%m-%d)" mem.md  || echo "⚠️  ATUALIZE mem.md COM A MUDANÇA DE HOJE!"
+```
+
+### 11.5 Responsabilidade
+- **Autor da mudança** = autor da entrada no `mem.md`
+- **Reviewer** deve rejeitar PR sem entrada correspondente no `mem.md`
+- **CI futuro** pode automatizar: `git diff HEAD~1 --name-only | xargs -I{} grep -l {} mem.md || fail`
+
+### 11.6 Exceções (Não Precisam de Entrada)
+- Apenas formatação (whitespace, trailing commas) sem mudança semântica
+- Atualização de `CHANGELOG.md` gerado automaticamente
+- `data/` outputs (gitignored, runtime only)
+
+---
+
 ## HISTÓRICO DE VERSÕES DA CONSTITUIÇÃO
 
 | Versão | Data | Autor | Resumo |
 |--------|------|-------|--------|
 | 1.0.0 | 2026-11-14 | pereira | Criação inicial — filosofia, estrutura, regras, workflows, padrões |
+| 1.1.0 | 2026-11-14 | pereira | Adicionada Seção 11: Memória Persistente Obrigatória (mem.md) |
 
 ---
 
