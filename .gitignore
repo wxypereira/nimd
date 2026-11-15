@@ -49,6 +49,9 @@ Thumbs.db
 .env.*
 !.env.example
 
+# Memory log (memória persistente do projeto - não versionar)
+mem.md
+
 # Logs
 *.log
 logs/

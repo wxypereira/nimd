@@ -126,28 +126,29 @@ sudo ./scripts/optimize_memory.sh --remove-cron
 |---------|----------|-----------|
 | **Baseline** | schedutil | Sistema padrão |
 | **Performance** | performance | Após `performance.sh` |
+| **Memory** | schedutil | Após `optimize_memory.sh` (drop_caches + compaction) |
 
 ### CPU Compute (stress-ng bogo ops/s)
 
-| Métrica | Baseline | Performance | Variação |
-|---------|----------|-------------|----------|
-| **Single Thread** | 1,372.67 | 1,287.90 | **-6.2%** ⬇️ |
-| **All Cores (4)** | 3,832.83 | **5,108.14** | **+33.3%** ⬆️ |
+| Métrica | Baseline | Performance | Δ Perf | Memory | Δ Mem |
+|---------|----------|-------------|--------|--------|-------|
+| **Single Thread** | 1,372.67 | 1,287.90 | -6.2% ⬇️ | **1,396.94** | **+1.8%** ⬆️ |
+| **All Cores (4)** | 3,832.83 | **5,108.14** | +33.3% ⬆️ | **5,004.28** | **+30.6%** ⬆️ |
 
 ### sysbench CPU (events/sec - prime numbers)
 
-| Métrica | Baseline | Performance | Variação |
-|---------|----------|-------------|----------|
-| **Single Thread** | 37.78 | 36.62 | **-3.1%** ⬇️ |
-| **Multi-Thread (4)** | 136.53 | **145.32** | **+6.4%** ⬆️ |
-| **Latência p95 (ms)** | 38.25 | **28.67** | **-25%** ⬆️ (melhor) |
+| Métrica | Baseline | Performance | Δ Perf | Memory | Δ Mem |
+|---------|----------|-------------|--------|--------|-------|
+| **Single Thread** | 37.78 | 36.62 | -3.1% ⬇️ | **39.58** | **+4.8%** ⬆️ |
+| **Multi-Thread (4)** | 136.53 | **145.32** | +6.4% ⬆️ | **140.66** | **+3.0%** ⬆️ |
+| **Latência p95 (ms)** | 38.25 | **28.67** | -25% ⬆️ | **27.17** | **-29%** ⬆️ (melhor) |
 
 ### Memória e Context Switching
 
-| Métrica | Baseline | Performance | Variação |
-|---------|----------|-------------|----------|
-| **Memory BW (ops/s)** | 193,172 | 182,681 | **-5.4%** ⬇️ |
-| **Context Switch (ops/s)** | N/A | 965,161 | — |
+| Métrica | Baseline | Performance | Δ Perf | Memory | Δ Mem |
+|---------|----------|-------------|--------|--------|-------|
+| **Memory BW (ops/s)** | 193,172 | 182,681 | -5.4% ⬇️ | **101,704** | **-47.3%** ⬇️ ⚠️ |
+| **Context Switch (ops/s)** | N/A | 965,161 | — | **955,830** | — |
 
 ### Frequência Média Sustentada
 
@@ -155,6 +156,7 @@ sudo ./scripts/optimize_memory.sh --remove-cron
 |---------|------------|
 | Baseline | Variável (1.8–3.6 GHz) |
 | Performance | **3,200–3,300 MHz** (fixo) |
+| Memory | **schedutil** (variável 1.8–3.6 GHz) |
 
 ### Análise
 
@@ -162,18 +164,17 @@ sudo ./scripts/optimize_memory.sh --remove-cron
 |---------|-----------|
 | **Multi-thread** | **Ganho real de +6% a +33%** — frequência fixa no máximo (3.6 GHz) elimina throttling e latência de ramp-up |
 | **Single-thread** | Ligeira queda (-3% a -6%) — `schedutil` já escala rápido para bursts; `performance` fixa no max mas perde boost oportunístico |
-| **Latência (p95)** | **Melhora 25%** — previsibilidade total, sem variações de governor |
-| **Memória** | Queda marginal (-5%) — não é CPU-bound, limitado por controlador de memória |
-| **Estabilidade** | **Muito superior** — frequência travada em 3.2–3.3 GHz vs. oscilação 1.6–3.6 GHz |
+| **Latência (p95)** | **Melhora 25-29%** — previsibilidade total, sem variações de governor (Performance: -25%, Memory: -29%) |
+| **Memória (Performance)** | Queda marginal (-5%) — não é CPU-bound, limitado por controlador de memória |
+| **Memória (Memory opt.)** | **Queda severa (-47%)** ⚠️ — `drop_caches=3` limpa pagecache ativo; stress-ng detectou bit errors (possível hardware) |
+| **Estabilidade** | **Muito superior** (Performance) — frequência travada em 3.2–3.3 GHz vs. oscilação 1.6–3.6 GHz |
 
 ### Trade-offs
 
-| Prós | Contras |
-|------|---------|
-| ✅ Throughput sustentado multi-core +33% | ❌ Single-thread ligeiramente mais lento |
-| ✅ Latência previsível (ideal para gaming/RT) | ❌ **Consumo +30–50W**, temp +15–25°C |
-| ✅ Zero throttling térmico por governor | ❌ Reduz vida útil se cooling insuficiente |
-| ✅ Ideal para compilação, rendering, VMs | ❌ Não use em bateria |
+| Cenário | Prós | Contras |
+|---------|------|---------|
+| **Performance** | ✅ Throughput MT +33%<br>✅ Latência p95 -25%<br>✅ Frequência fixa, zero throttling | ❌ Single-thread -6%<br>❌ Consumo +30–50W, temp +15–25°C<br>❌ Requer cooling robusto |
+| **Memory** | ✅ Single-thread +1.8% (melhor que baseline)<br>✅ Latência p95 -29% (melhor de todos)<br>✅ MT +30.6% (próximo do Performance)<br>✅ Baixo consumo/Temp (governor schedutil) | ❌ **Memory BW -47%** ⚠️<br>❌ Bit errors detectados no stress-ng<br>❌ Compaction não ativada (kernel limitation) |
 
 ## Execução da Suite Comparativa
 
