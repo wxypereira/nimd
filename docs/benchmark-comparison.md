@@ -96,10 +96,10 @@
 
 ```bash
 # Baseline (schedutil)
-cat /home/pereira/system-optimization/data/benchmarks/benchmark_20261114_160725_schedutil.log
+cat ~/system-optimization/data/benchmarks/benchmark_20261114_160725_schedutil.log
 
 # Performance
-cat /home/pereira/system-optimization/data/benchmarks/benchmark_20261114_161222_performance.log
+cat ~/system-optimization/data/benchmarks/benchmark_20261114_161222_performance.log
 ```
 
 ---
