@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# generate_comparison_report.sh - Gera relatório comparativo a partir de logs existentes
+# generate_comparison_report - Gera relatório comparativo a partir de logs existentes
 # =============================================================================
 
 set -euo pipefail
@@ -259,8 +259,8 @@ main() {
 | Cenário | Descrição | Governor | Log |
 |---------|-----------|----------|-----|
 | **Baseline** | Sistema padrão (governor schedutil) | $(get_governor_from_log "${baseline_log}") | $(basename "${baseline_log}") |
-| **Performance** | Após \`performance.sh\` (governor=performance, turbo, C-states off) | $(get_governor_from_log "${perf_log}") | $(basename "${perf_log}") |
-| **Memory** | Após \`optimize_memory.sh\* (drop_caches + compaction) | $(get_governor_from_log "${mem_log}") | *(simulado)* |
+| **Performance** | Após \`performance\` (governor=performance, turbo, C-states off) | $(get_governor_from_log "${perf_log}") | $(basename "${perf_log}") |
+| **Memory** | Após \`optimize_memory\* (drop_caches + compaction) | $(get_governor_from_log "${mem_log}") | *(simulado)* |
 | **Combined** | Performance + Memory | $(get_governor_from_log "${combined_log}") | *(simulado)* |
 
 > \* Logs de Memory e Combined não disponíveis ainda — usando Performance como referência.
@@ -308,13 +308,13 @@ main() {
 
 ## Análise e Conclusões
 
-### Performance Mode (performance.sh)
+### Performance Mode (performance)
 $(analyze_performance "${d_perf_st}" "${d_perf_mt}" "${d_perf_sys_mt}" "${d_perf_lat}" "${d_perf_freq}")
 
-### Memory Optimization (optimize_memory.sh)
+### Memory Optimization (optimize_memory)
 - **Overhead mínimo** — drop_caches é rápido; compactação só ativa se CONFIG_COMPACTION=y.
 - **Ideal para**: sistemas com memory pressure, workloads com alocações grandes.
-- **Nota**: Logs reais de memory optimization não disponíveis — execute \`sudo scripts/test_benchmarks.sh --memory-only\` para dados reais.
+- **Nota**: Logs reais de memory optimization não disponíveis — execute \`sudo scripts/test_benchmarks --memory-only\` para dados reais.
 
 ### Combined (Performance + Memory)
 - **Sinergia esperada**: Performance mode + memory cleanup = ganho máximo multi-thread.
@@ -350,7 +350,7 @@ cat ${perf_log}
 
 ---
 
-*Relatório gerado automaticamente por \`generate_comparison_report.sh\`*
+*Relatório gerado automaticamente por \`generate_comparison_report\`*
 *Baseado em dados reais de benchmark (baseline vs performance)*
 EOF
 

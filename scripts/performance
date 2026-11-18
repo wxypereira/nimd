@@ -1,5 +1,5 @@
 #!/bin/bash
-# performance.sh - Maximiza performance da CPU sem limites
+# performance - Maximiza performance da CPU sem limites
 # Requer: sudo / root
 
 set -euo pipefail

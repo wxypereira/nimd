@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# core.sh — Lógica única do System Optimization Toolkit
-# Uso: core.sh <comando> [opções]
+# core — Lógica única do System Optimization Toolkit
+# Uso: core <comando> [opções]
 # Modos: CLI direto | JSON output para GUI (--json)
 
 set -euo pipefail
@@ -9,13 +9,13 @@ set -euo pipefail
 readonly CORE_VERSION="2.0.0"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-readonly DATA_DIR="${PROJECT_ROOT}/data"
+readonly DATA_DIR="$/tmp"
 readonly LIB_DIR="${SCRIPT_DIR}/lib"
 
 # ========== CARREGAR LIBS ==========
-source "${LIB_DIR}/common.sh"
-source "${LIB_DIR}/hardware.sh"
-source "${LIB_DIR}/thermal.sh"
+source "${LIB_DIR}/common"
+source "${LIB_DIR}/hardware"
+source "${LIB_DIR}/thermal"
 
 # ========== VARIÁVEIS GLOBAIS ==========
 JSON_OUTPUT=false
@@ -29,7 +29,7 @@ usage() {
 System Optimization Toolkit — Core Engine
 
 USO:
-    core.sh <comando> [opções]
+    core <comando> [opções]
 
 COMANDOS:
     audit           Auditoria completa do sistema (read-only)
@@ -48,12 +48,12 @@ OPÇÕES GLOBAIS:
     --help          Ajuda do comando específico
 
 EXEMPLOS:
-    core.sh audit --json                    # Auditoria para GUI
-    core.sh tune --apply --dry-run          # Simular tuning
-    core.sh memory --cron daily             # Otimização memória + cron diário
-    core.sh bench --quick                   # Benchmark rápido
-    core.sh test-suite --baseline-only      # Apenas baseline
-    core.sh report                          # Gerar relatório markdown
+    core audit --json                    # Auditoria para GUI
+    core tune --apply --dry-run          # Simular tuning
+    core memory --cron daily             # Otimização memória + cron diário
+    core bench --quick                   # Benchmark rápido
+    core test-suite --baseline-only      # Apenas baseline
+    core report                          # Gerar relatório markdown
 
 EOF
 }
@@ -456,7 +456,7 @@ cmd_test_suite() {
     # Generate report
     if [[ ${#logs[@]} -ge 2 ]]; then
         log_info "Gerando relatório comparativo..."
-        "${SCRIPT_DIR}/generate_comparison_report.sh"
+        "${SCRIPT_DIR}/generate_comparison_report"
     fi
 
     local end_ms=$(date +%s%3N)
@@ -466,7 +466,7 @@ cmd_test_suite() {
 
 # ========== COMANDO: REPORT ==========
 cmd_report() {
-    "${SCRIPT_DIR}/generate_comparison_report.sh"
+    "${SCRIPT_DIR}/generate_comparison_report"
 }
 
 # ========== MAIN ==========

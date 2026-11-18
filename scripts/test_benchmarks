@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# test_benchmarks.sh - Framework de Testes e Benchmarks Comparativos
+# test_benchmarks - Framework de Testes e Benchmarks Comparativos
 #
 # Executa suites de benchmarks em diferentes cenários:
 #   1. Baseline (governor padrão do sistema)
-#   2. Performance Mode (após performance.sh)
-#   3. Memory Optimized (após optimize_memory.sh)
+#   2. Performance Mode (após performance)
+#   3. Memory Optimized (após optimize_memory)
 #   4. Combined (performance + memory)
 #
 # Gera relatório comparativo em Markdown.
@@ -20,9 +20,9 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
 readonly RESULTS_DIR="${PROJECT_ROOT}/data/benchmarks"
 readonly REPORT_FILE="${PROJECT_ROOT}/docs/benchmark-comparison.md"
-readonly PERFORMANCE_SCRIPT="${SCRIPT_DIR}/performance.sh"
-readonly MEMORY_SCRIPT="${SCRIPT_DIR}/optimize_memory.sh"
-readonly BENCHMARK_SCRIPT="${SCRIPT_DIR}/benchmark.sh"
+readonly PERFORMANCE_SCRIPT="${SCRIPT_DIR}/performance"
+readonly MEMORY_SCRIPT="${SCRIPT_DIR}/optimize_memory"
+readonly BENCHMARK_SCRIPT="${SCRIPT_DIR}/benchmark"
 
 # Cores
 readonly RED='\033[0;31m'
@@ -98,7 +98,7 @@ restore_default_governor() {
 # Aplicar performance mode
 # -----------------------------------------------------------------------------
 apply_performance_mode() {
-    log STEP "Aplicando Performance Mode (performance.sh)..."
+    log STEP "Aplicando Performance Mode (performance)..."
     if [[ "${DRY_RUN}" == true ]]; then
         log INFO "[DRY-RUN] Executaria: sudo ${PERFORMANCE_SCRIPT}"
         return 0
@@ -117,7 +117,7 @@ apply_performance_mode() {
 # Aplicar memory optimization
 # -----------------------------------------------------------------------------
 apply_memory_optimization() {
-    log STEP "Aplicando Memory Optimization (optimize_memory.sh)..."
+    log STEP "Aplicando Memory Optimization (optimize_memory)..."
     if [[ "${DRY_RUN}" == true ]]; then
         log INFO "[DRY-RUN] Executaria: sudo ${MEMORY_SCRIPT} --no-cron"
         return 0
@@ -332,8 +332,8 @@ generate_report() {
 | Cenário | Descrição | Governor | Log |
 |---------|-----------|----------|-----|
 | **Baseline** | Sistema padrão (sem otimizações) | $(get_governor_from_log "${baseline_log}") | $(basename "${baseline_log}") |
-| **Performance** | Após \`performance.sh\` (governor=performance, turbo, C-states off) | $(get_governor_from_log "${perf_log}") | $(basename "${perf_log}") |
-| **Memory** | Após \`optimize_memory.sh\` (drop_caches + compaction) | $(get_governor_from_log "${mem_log}") | $(basename "${mem_log}") |
+| **Performance** | Após \`performance\` (governor=performance, turbo, C-states off) | $(get_governor_from_log "${perf_log}") | $(basename "${perf_log}") |
+| **Memory** | Após \`optimize_memory\` (drop_caches + compaction) | $(get_governor_from_log "${mem_log}") | $(basename "${mem_log}") |
 | **Combined** | Performance + Memory | $(get_governor_from_log "${combined_log}") | $(basename "${combined_log}") |
 
 ---
@@ -379,10 +379,10 @@ generate_report() {
 
 ## Análise e Conclusões
 
-### Performance Mode (performance.sh)
+### Performance Mode (performance)
 $(analyze_performance "${d_perf_st}" "${d_perf_mt}" "${d_perf_sys_mt}" "${d_perf_lat}" "${d_perf_freq}")
 
-### Memory Optimization (optimize_memory.sh)
+### Memory Optimization (optimize_memory)
 $(analyze_memory "${d_mem_st}" "${d_mem_mt}" "${d_mem_sys_mt}" "${d_mem_lat}" "${d_mem_freq}")
 
 ### Combined (Performance + Memory)
@@ -422,7 +422,7 @@ cat ${combined_log}
 
 ---
 
-*Relatório gerado automaticamente por \`test_benchmarks.sh\`*
+*Relatório gerado automaticamente por \`test_benchmarks\`*
 EOF
 
     log OK "Relatório gerado: ${REPORT_FILE}"
@@ -542,10 +542,10 @@ get_trend() {
 # -----------------------------------------------------------------------------
 show_help() {
     cat <<EOF
-test_benchmarks.sh - Framework de Testes Comparativos
+test_benchmarks - Framework de Testes Comparativos
 
 USO:
-    sudo ./test_benchmarks.sh [OPÇÕES]
+    sudo ./test_benchmarks [OPÇÕES]
 
 OPÇÕES:
     --baseline-only      Apenas executa baseline
@@ -558,9 +558,9 @@ OPÇÕES:
     --help               Exibe esta ajuda
 
 EXEMPLOS:
-    sudo ./test_benchmarks.sh                    # Suite completa
-    sudo ./test_benchmarks.sh --quick            # Rápido (para teste)
-    sudo ./test_benchmarks.sh --performance-only # Apenas performance
+    sudo ./test_benchmarks                    # Suite completa
+    sudo ./test_benchmarks --quick            # Rápido (para teste)
+    sudo ./test_benchmarks --performance-only # Apenas performance
 
 NOTA: Requer root para aplicar otimizações.
 EOF
@@ -594,7 +594,7 @@ parse_args() {
                 ;;
             --quick)
                 QUICK_MODE=true
-                # Modifica benchmark.sh para ser mais rápido via env
+                # Modifica benchmark para ser mais rápido via env
                 export BENCHMARK_QUICK=1
                 ;;
             --dry-run)

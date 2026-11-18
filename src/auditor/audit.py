@@ -301,7 +301,7 @@ class LinuxAuditor:
 
     def get_output_path(self) -> Path:
         """Retorna caminho para o arquivo de saída do relatório."""
-        return self.get_project_root() / "data" / "diagnostico_sistema.md"
+        return Path("/tmp") / "data" / "diagnostico_sistema.md"
 
     def to_markdown(self) -> str:
         """Gera relatório final em Markdown."""

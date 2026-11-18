@@ -1,5 +1,5 @@
 #!/bin/bash
-# benchmark.sh - CPU benchmarks para comparar antes/depois do performance.sh
+# benchmark - CPU benchmarks para comparar antes/depois do performance
 
 set -euo pipefail
 

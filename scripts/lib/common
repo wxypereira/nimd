@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# common.sh — Funções compartilhadas para scripts do System Optimization Toolkit
+# common — Funções compartilhadas para scripts do System Optimization Toolkit
 
 # ========== CORES ==========
 readonly RED='\033[0;31m'

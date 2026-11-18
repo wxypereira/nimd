@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hardware.sh — Detecção unificada de hardware (CPU, GPU, RAM, Motherboard)
+# hardware — Detecção unificada de hardware (CPU, GPU, RAM, Motherboard)
 
 # ========== CPU ==========
 audit_hardware_cpu() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# thermal.sh — Monitoramento térmico, alertas e proteção
+# thermal — Monitoramento térmico, alertas e proteção
 
 # ========== CONSTANTES TÉRMICAS ==========
 readonly THERMAL_WARN_IDLE=50      # °C idle warning
