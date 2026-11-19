@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# hdd — Otimizador HDD (scheduler, read-ahead, APM, spindown via hdparm)
+# Uso: hdd <probe|apply|status|revert> [opções]
+
+set -euo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common"
+
+# ========== CONSTANTES ==========
+readonly BLOCK_BASE="/sys/block"
+readonly HDPARM_PATH="/usr/sbin/hdparm"
+readonly STATE_DIR="/var/lib/nimd/state"
+readonly STATE_FILE="${STATE_DIR}/hdd.json"
+
+readonly READ_AHEAD_MIN=0
+readonly READ_AHEAD_MAX=16384
+readonly APM_MIN=1
+readonly APM_MAX=254
+readonly SPINDOWN_MIN=0
+readonly SPINDOWN_MAX=255
+
+readonly SCHED_MQ_DEADLINE="mq-deadline"
+readonly SCHED_BFQ="bfq"
+readonly SCHED_KYBER="kyber"
+VALID_SCHEDS=("$SCHED_MQ_DEADLINE" "$SCHED_BFQ" "$SCHED_KYBER")
+
+readonly SILENT_RA=128
+readonly SILENT_APM=128
+readonly SILENT_SPIN=240
+
+readonly BALANCED_RA=256
+readonly BALANCED_APM=254
+readonly BALANCED_SPIN=0
+
+readonly PERF_RA=8192
+readonly PERF_APM=254
+readonly PERF_SPIN=0
+
+JSON_OUTPUT=false
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+
+# ========== HELP ==========
+usage() {
+    cat <<'EOF'
+HDD Optimizer — HDD I/O tuning + APM/spindown
+
+USO:
+    hdd <comando> [opções]
+
+COMANDOS:
+    probe           Detecta HDDs (rotational=1)
+    apply           Aplica perfil (silent|balanced|performance|custom)
+    status          Mostra estado atual
+    revert          Restaura estado anterior
+
+OPÇÕES:
+    --profile <p>   Perfil: silent, balanced, performance, custom
+    --scheduler     I/O scheduler (custom)
+    --read-ahead    Read ahead KB (custom)
+    --apm           APM level 1-254 (custom)
+    --spindown      Spindown timeout 0-255 (5s units) (custom)
+    --json          Saída JSON Lines
+    --dry-run       Simula sem aplicar
+    --verbose       Logs detalhados
+    --quiet         Apenas erros/resultados
+    --help          Esta ajuda
+
+EXEMPLOS:
+    hdd probe --json
+    hdd apply --profile balanced --json
+    hdd apply --profile custom --apm 128 --spindown 240 --json
+    hdd status --json
+    hdd revert --json
+EOF
+}
+
+# ========== JSON HELPERS ==========
+json_emit() { [[ "$JSON_OUTPUT" == true ]] && printf '%s\n' "$1"; }
+json_progress() { json_emit "$(jq -n --arg type "progress" --arg stage "$1" --argjson current "$2" --argjson total "$3" --argjson percent "$4" --arg msg "$5" '{type:$type, stage:$stage, current:$current, total:$total, percent:$percent, message:$msg}')"; }
+json_result() { json_emit "$(jq -n --arg type "result" --arg section "$1" --argjson data "$2" '{type:$type, section:$section, data:$data}')"; }
+json_complete() { json_emit "$(jq -n --arg type "complete" --argjson exit_code "$1" --argjson duration_ms "$2" --arg msg "$3" '{type:$type, exit_code:$exit_code, duration_ms:$duration_ms, message:$msg}')"; }
+json_error() { json_emit "$(jq -n --arg type "error" --arg code "$1" --arg msg "$2" '{type:$type, code:$code, message:$msg}')"; }
+
+# ========== UTILITÁRIOS ==========
+ensure_state_dir() { mkdir -p "$STATE_DIR"; }
+
+root_check() { [[ $EUID -eq 0 ]] || { log_err "Root required"; return 1; }; }
+
+safe_read() { local p="$1"; [[ -r "$p" ]] && cat "$p" 2>/dev/null || return 1; }
+
+safe_write() {
+    local p="$1" v="$2" min="${3:-}" max="${4:-}"
+    [[ -w "$p" ]] || return 1
+    [[ -n "$min" && -n "$max" ]] && { (( v < min || v > max )) && return 1; }
+    echo "$v" > "$p" 2>/dev/null
+}
+
+safe_read_int() { local v=$(safe_read "$1"); [[ -n "$v" && "$v" =~ ^[0-9]+$ ]] && echo "$v"; }
+
+read_current_scheduler() {
+    local p="$1"
+    local content=$(safe_read "$p")
+    [[ -z "$content" ]] && return 1
+    for token in $content; do
+        token="${token#[}"; token="${token%]}"
+        [[ -n "$token" ]] && { echo "$token"; return; }
+    done
+}
+
+is_valid_sched() {
+    local s="$1"
+    for v in "${VALID_SCHEDS[@]}"; do [[ "$v" == "$s" ]] && return 0; done
+    return 1
+}
+
+run_hdparm() {
+    local args=("$@")
+    [[ -x "$HDPARM_PATH" ]] || return 1
+    local out
+    out=$("$HDPARM_PATH" "${args[@]}" 2>/dev/null) || return 1
+    echo "$out"
+}
+
+read_apm() {
+    local dev="$1"
+    local out=$(run_hdparm -B "$dev") || return 1
+    echo "$out" | grep -oP 'APM level\s*=\s*\K\d+'
+}
+
+read_spindown() {
+    local dev="$1"
+    local out=$(run_hdparm -I "$dev") || return 1
+    echo "$out" | grep -i 'standby' | grep -oP '\d+' | head -1
+}
+
+set_apm() {
+    local dev="$1" val="$2"
+    (( val >= APM_MIN && val <= APM_MAX )) || return 1
+    run_hdparm -B "$val" "$dev" >/dev/null
+}
+
+set_spindown() {
+    local dev="$1" val="$2"
+    (( val >= SPINDOWN_MIN && val <= SPINDOWN_MAX )) || return 1
+    run_hdparm -S "$val" "$dev" >/dev/null
+}
+
+probe_hdd() {
+    [[ -d "$BLOCK_BASE" ]] || { json_error "HARDWARE_NOT_FOUND" "Block sysfs not found"; return 1; }
+    [[ -x "$HDPARM_PATH" ]] || log_warn "hdparm not found at $HDPARM_PATH"
+
+    local -a devices=()
+    for block in "$BLOCK_BASE"/*; do
+        [[ -d "$block" ]] || continue
+        local name=$(basename "$block")
+        [[ "$name" =~ ^sd[a-z]+$ ]] || continue
+
+        local rotational=$(safe_read "$block/queue/rotational")
+        [[ -n "$rotational" && "$rotational" -eq 1 ]] || continue
+
+        local sched_path="$block/queue/scheduler"
+        local nr_path="$block/queue/nr_requests"
+        local ra_path="$block/queue/read_ahead_kb"
+        [[ -f "$sched_path" && -f "$nr_path" && -f "$ra_path" ]] || continue
+
+        local avail_scheds=()
+        local content=$(safe_read "$sched_path")
+        for token in $content; do
+            token="${token#[}"; token="${token%]}"
+            is_valid_sched "$token" && avail_scheds+=("$token")
+        done
+        [[ ${#avail_scheds[@]} -eq 0 ]] && continue
+
+        local model=$(safe_read "$block/device/model" || echo "unknown")
+        local firmware=$(safe_read "$block/device/rev" || echo "unknown")
+        local dev_path="/dev/$name"
+        [[ -e "$dev_path" ]] || continue
+
+        local device_json
+        device_json=$(jq -n \
+            --arg block "$block" --arg name "$name" --arg dev_path "$dev_path" \
+            --arg sched "$sched_path" --arg nr "$nr_path" --arg ra "$ra_path" \
+            --arg model "$model" --arg firmware "$firmware" \
+            --argjson scheds "$(printf '%s\n' "${avail_scheds[@]}" | jq -R . | jq -s .)" \
+            '{block:$block, name:$name, dev_path:$dev_path, scheduler_path:$sched, nr_requests_path:$nr, read_ahead_path:$ra, model:$model, firmware:$firmware, available_schedulers:$scheds}')
+        devices+=("$device_json")
+    done
+
+    [[ ${#devices[@]} -eq 0 ]] && { json_error "HARDWARE_NOT_FOUND" "No HDD devices found"; return 1; }
+    printf '%s\n' "${devices[@]}" | jq -s .
+}
+
+apply_hdd() {
+    local profile="$1" sched="$2" ra_kb="$3" apm_lvl="$4" spindown="$5"
+    root_check || { json_error "PERMISSION_DENIED" "Root required"; return 1; }
+
+    local devices_json
+    devices_json=$(probe_hdd) || return 1
+    local count=$(echo "$devices_json" | jq 'length')
+    [[ $count -eq 0 ]] && { json_error "HARDWARE_NOT_FOUND" "No HDD devices"; return 1; }
+
+    # Validação custom
+    if [[ "$profile" == "custom" ]]; then
+        [[ -n "$sched" ]] && is_valid_sched "$sched" || { json_error "INVALID_PROFILE" "Invalid scheduler: $sched"; return 1; }
+        [[ -n "$ra_kb" ]] && (( ra_kb >= READ_AHEAD_MIN && ra_kb <= READ_AHEAD_MAX )) || { json_error "SAFE_MODE_VIOLATION" "read_ahead out of range"; return 1; }
+        [[ -n "$apm_lvl" ]] && (( apm_lvl >= APM_MIN && apm_lvl <= APM_MAX )) || { json_error "SAFE_MODE_VIOLATION" "apm out of range [1,254]"; return 1; }
+        [[ -n "$spindown" ]] && (( spindown >= SPINDOWN_MIN && spindown <= SPINDOWN_MAX )) || { json_error "SAFE_MODE_VIOLATION" "spindown out of range [0,255]"; return 1; }
+    fi
+
+    ensure_state_dir
+    local -a reverted=() applied=() warnings=()
+    local start_ms=$(date +%s%3N)
+
+    for i in $(seq 0 $((count - 1))); do
+        local dev=$(echo "$devices_json" | jq ".[$i]")
+        local block=$(echo "$dev" | jq -r .block)
+        local name=$(echo "$dev" | jq -r .name)
+        local dev_path=$(echo "$dev" | jq -r .dev_path)
+        local sched_path=$(echo "$dev" | jq -r .scheduler_path)
+        local nr_path=$(echo "$dev" | jq -r .nr_requests_path)
+        local ra_path=$(echo "$dev" | jq -r .read_ahead_path)
+        local avail_scheds=$(echo "$dev" | jq -r '.available_schedulers | join(",")')
+
+        local orig_sched=$(read_current_scheduler "$sched_path")
+        local orig_nr=$(safe_read_int "$nr_path")
+        local orig_ra=$(safe_read_int "$ra_path")
+        local orig_apm=$(read_apm "$dev_path")
+        local orig_spin=$(read_spindown "$dev_path")
+
+        reverted+=($(jq -n \
+            --arg block "$block" --arg sched "$orig_sched" --arg nr "$orig_nr" --arg ra "$orig_ra" \
+            --arg apm "$orig_apm" --arg spin "$orig_spin" \
+            '{block:$block, scheduler:$sched, nr_requests:$nr, read_ahead_kb:$ra, apm:$apm, spindown:$spin}'))
+
+        [[ "$DRY_RUN" == true ]] && { log_warn "DRY-RUN: $name"; continue; }
+
+        # Determina valores do perfil
+        local p_sched="" p_ra="" p_apm="" p_spin=""
+        if [[ "$profile" == "custom" ]]; then
+            p_sched="$sched"
+            p_ra="$ra_kb"
+            p_apm="$apm_lvl"
+            p_spin="$spindown"
+        elif [[ "$profile" == "silent" ]]; then
+            [[ "$avail_scheds" == *"$SCHED_BFQ"* ]] && p_sched="$SCHED_BFQ"
+            p_ra=$SILENT_RA
+            p_apm=$SILENT_APM
+            p_spin=$SILENT_SPIN
+        elif [[ "$profile" == "balanced" ]]; then
+            [[ "$avail_scheds" == *"$SCHED_MQ_DEADLINE"* ]] && p_sched="$SCHED_MQ_DEADLINE" || [[ "$avail_scheds" == *"$SCHED_KYBER"* ]] && p_sched="$SCHED_KYBER"
+            p_ra=$BALANCED_RA
+            p_apm=$BALANCED_APM
+            p_spin=$BALANCED_SPIN
+        elif [[ "$profile" == "performance" ]]; then
+            [[ "$avail_scheds" == *"$SCHED_MQ_DEADLINE"* ]] && p_sched="$SCHED_MQ_DEADLINE"
+            p_ra=$PERF_RA
+            p_apm=$PERF_APM
+            p_spin=$PERF_SPIN
+        fi
+
+        # Aplica
+        [[ -n "$p_sched" ]] && {
+            echo "$avail_scheds" | grep -qw "$p_sched" || { warnings+=("$name: Scheduler $p_sched not available"); p_sched=""; }
+            [[ -n "$p_sched" ]] && safe_write "$sched_path" "$p_sched" || warnings+=("$name: Failed to set scheduler")
+        }
+        [[ -n "$p_ra" ]] && safe_write "$ra_path" "$p_ra" $READ_AHEAD_MIN $READ_AHEAD_MAX || warnings+=("$name: Failed to set read_ahead")
+        [[ -n "$p_apm" ]] && set_apm "$dev_path" "$p_apm" || warnings+=("$name: Failed to set APM")
+        [[ -n "$p_spin" ]] && set_spindown "$dev_path" "$p_spin" || warnings+=("$name: Failed to set spindown")
+
+        applied+=($(jq -n \
+            --arg block "$block" --arg sched "$p_sched" --arg ra "$p_ra" \
+            --arg apm "$p_apm" --arg spin "$p_spin" \
+            '{block:$block, scheduler:$sched, read_ahead_kb:$ra, apm:$apm, spindown:$spin}'))
+    done
+
+    local state=$(jq -n --argjson reverted "$(printf '%s\n' "${reverted[@]}" | jq -s .)" '{devices:$reverted}')
+    echo "$state" > "$STATE_FILE"
+
+    local end_ms=$(date +%s%3N)
+    local success=$(echo "$applied" | jq -s 'length > 0')
+    json_result "applied" "$(printf '%s\n' "${applied[@]}" | jq -s .)"
+    json_result "reverted" "$state"
+    [[ ${#warnings[@]} -gt 0 ]] && json_result "warnings" "$(printf '%s\n' "${warnings[@]}" | jq -R . | jq -s .)"
+    json_complete $([[ "$success" == true ]] && echo 0 || echo 1) $((end_ms - start_ms)) $([[ "$success" == true ]] && echo "HDD profile applied" || echo "No devices configured")
+}
+
+status_hdd() {
+    local devices_json
+    devices_json=$(probe_hdd) || return 1
+    local count=$(echo "$devices_json" | jq 'length')
+    local -a devices_out=()
+
+    for i in $(seq 0 $((count - 1))); do
+        local dev=$(echo "$devices_json" | jq ".[$i]")
+        local block=$(echo "$dev" | jq -r .block)
+        local name=$(echo "$dev" | jq -r .name)
+        local dev_path=$(echo "$dev" | jq -r .dev_path)
+        local sched_path=$(echo "$dev" | jq -r .scheduler_path)
+        local ra_path=$(echo "$dev" | jq -r .read_ahead_path)
+        local model=$(echo "$dev" | jq -r .model)
+        local firmware=$(echo "$dev" | jq -r .firmware)
+        local avail_scheds=$(echo "$dev" | jq -r '.available_schedulers | join(",")')
+
+        local curr_sched=$(read_current_scheduler "$sched_path")
+        local curr_ra=$(safe_read_int "$ra_path")
+        local curr_apm=$(read_apm "$dev_path")
+        local curr_spin=$(read_spindown "$dev_path")
+
+        # Handle empty values for jq --argjson
+        local ra_json="${curr_ra:-null}"
+        local apm_json="${curr_apm:-null}"
+        local spin_json="${curr_spin:-null}"
+
+        local device_out
+        device_out=$(jq -n \
+            --arg block "$block" --arg name "$name" --arg dev_path "$dev_path" \
+            --arg model "$model" --arg firmware "$firmware" \
+            --arg sched "$curr_sched" --arg avail "$avail_scheds" \
+            --argjson ra "$ra_json" --argjson apm "$apm_json" --argjson spin "$spin_json" \
+            '{block:$block, name:$name, dev_path:$dev_path, model:$model, firmware:$firmware, scheduler:$sched, available_schedulers:($avail|split(",")), read_ahead_kb:$ra, apm_level:$apm, spindown_timeout:$spin}')
+        devices_out+=("$device_out")
+    done
+
+    local metrics=$(jq -n --argjson total "$count" '{total_devices:$total}')
+    local current_profile="unknown"
+    [[ -f "$STATE_FILE" ]] && current_profile=$(cat "$STATE_FILE" 2>/dev/null | jq -r .profile // "unknown" 2>/dev/null || echo "unknown")
+    json_result "status" "$(jq -n --arg profile "$current_profile" --argjson metrics "$metrics" --argjson devices "$(printf '%s\n' "${devices_out[@]}" | jq -s .)" '{current_profile:$profile, metrics:$metrics, devices:$devices}')"
+}
+
+revert_hdd() {
+    [[ -f "$STATE_FILE" ]] || { json_error "HARDWARE_NOT_FOUND" "No saved state"; return 1; }
+    local state=$(cat "$STATE_FILE")
+    local count=$(echo "$state" | jq '.devices | length')
+    local -a reverted=() warnings=()
+    local success_count=0
+
+    local devices_json
+    devices_json=$(probe_hdd) || return 1
+
+    for i in $(seq 0 $((count - 1))); do
+        local st=$(echo "$state" | jq ".devices[$i]")
+        local block=$(echo "$st" | jq -r .block)
+        local dev=$(echo "$devices_json" | jq --arg b "$block" '.[] | select(.block==$b)')
+        [[ -z "$dev" ]] && { warnings+=("Device not found: $block"); continue; }
+
+        local name=$(echo "$dev" | jq -r .name)
+        local dev_path=$(echo "$dev" | jq -r .dev_path)
+        local sched_path=$(echo "$dev" | jq -r .scheduler_path)
+        local ra_path=$(echo "$dev" | jq -r .read_ahead_path)
+        local avail_scheds=$(echo "$dev" | jq -r '.available_schedulers | join(",")')
+
+        local orig_sched=$(echo "$st" | jq -r .scheduler)
+        local orig_ra=$(echo "$st" | jq -r .read_ahead_kb)
+        local orig_apm=$(echo "$st" | jq -r .apm)
+        local orig_spin=$(echo "$st" | jq -r .spindown)
+
+        [[ -n "$orig_sched" && "$orig_sched" != "null" ]] && {
+            echo "$avail_scheds" | grep -qw "$orig_sched" && safe_write "$sched_path" "$orig_sched" && ((success_count++)) || warnings+=("$name: Original scheduler not available")
+        }
+        [[ -n "$orig_ra" && "$orig_ra" != "null" ]] && safe_write "$ra_path" "$orig_ra" $READ_AHEAD_MIN $READ_AHEAD_MAX && ((success_count++)) || warnings+=("$name: Failed to restore read_ahead")
+        [[ -n "$orig_apm" && "$orig_apm" != "null" ]] && set_apm "$dev_path" "$orig_apm" && ((success_count++)) || warnings+=("$name: Failed to restore APM")
+        [[ -n "$orig_spin" && "$orig_spin" != "null" ]] && set_spindown "$dev_path" "$orig_spin" && ((success_count++)) || warnings+=("$name: Failed to restore spindown")
+
+        reverted+=($(jq -n \
+            --arg block "$block" \
+            --arg sched "$orig_sched" --arg ra "$orig_ra" \
+            --arg apm "$orig_apm" --arg spin "$orig_spin" \
+            '{block:$block, restored_scheduler:$sched, restored_read_ahead_kb:$ra, restored_apm:$apm, restored_spindown:$spin}'))
+    done
+
+    rm -f "$STATE_FILE"
+    json_result "reverted" "$(printf '%s\n' "${reverted[@]}" | jq -s .)"
+    [[ ${#warnings[@]} -gt 0 ]] && json_result "warnings" "$(printf '%s\n' "${warnings[@]}" | jq -R . | jq -s .)"
+    json_complete $([[ $success_count -gt 0 ]] && echo 0 || echo 1) 0 $([[ $success_count -gt 0 ]] && echo "HDD state reverted" || echo "No devices reverted")
+}
+
+# ========== MAIN ==========
+main() {
+    # Parse global options manually (getopts doesn't handle long options well)
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --json|-j) JSON_OUTPUT=true; shift ;;
+            --dry-run|-d) DRY_RUN=true; shift ;;
+            --verbose|-v) VERBOSE=true; shift ;;
+            --quiet|-q) QUIET=true; shift ;;
+            --help|-h) usage; exit 0 ;;
+            --) shift; break ;;
+            -*) log_err "Unknown option: $1"; usage; exit 4 ;;
+            *) break ;;
+        esac
+    done
+
+    local cmd="${1:-help}"
+    shift || true
+
+    local profile="" sched="" ra_kb="" apm_lvl="" spindown=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --profile) profile="$2"; shift 2 ;;
+            --scheduler) sched="$2"; shift 2 ;;
+            --read-ahead) ra_kb="$2"; shift 2 ;;
+            --apm) apm_lvl="$2"; shift 2 ;;
+            --spindown) spindown="$2"; shift 2 ;;
+            *) log_err "Unknown option: $1"; usage; exit 4 ;;
+        esac
+    done
+
+    case $cmd in
+        probe)
+            probe_hdd
+            ;;
+        apply)
+            [[ -n "$profile" ]] || { log_err "--profile required"; exit 4; }
+            apply_hdd "$profile" "$sched" "$ra_kb" "$apm_lvl" "$spindown"
+            ;;
+        status)
+            status_hdd
+            ;;
+        revert)
+            revert_hdd
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            log_err "Unknown command: $cmd"
+            usage
+            exit 4
+            ;;
+    esac
+}
+
+[[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"

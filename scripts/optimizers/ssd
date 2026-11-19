@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# ssd — Otimizador SSD/NVMe (scheduler, nr_requests, APST, write cache)
+# Uso: ssd <probe|apply|status|revert> [opções]
+
+set -euo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common"
+
+# ========== CONSTANTES ==========
+readonly BLOCK_BASE="/sys/block"
+readonly STATE_DIR="/var/lib/nimd/state"
+readonly STATE_FILE="${STATE_DIR}/ssd.json"
+
+readonly NR_REQUESTS_MIN=32
+readonly NR_REQUESTS_MAX=4096
+readonly READ_AHEAD_MIN=0
+readonly READ_AHEAD_MAX=16384
+
+readonly SCHED_NONE="none"
+readonly SCHED_MQ_DEADLINE="mq-deadline"
+readonly SCHED_KYBER="kyber"
+readonly SCHED_BFQ="bfq"
+VALID_SCHEDS=("$SCHED_NONE" "$SCHED_MQ_DEADLINE" "$SCHED_KYBER" "$SCHED_BFQ")
+
+JSON_OUTPUT=false
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+
+# ========== HELP ==========
+usage() {
+    cat <<'EOF'
+SSD Optimizer — NVMe/SATA I/O tuning
+
+USO:
+    ssd <comando> [opções]
+
+COMANDOS:
+    probe           Detecta SSDs/NVMe
+    apply           Aplica perfil (silent|balanced|performance|custom)
+    status          Mostra estado atual
+    revert          Restaura estado anterior
+
+OPÇÕES:
+    --profile <p>   Perfil: silent, balanced, performance, custom
+    --scheduler     I/O scheduler (custom)
+    --nr-requests   Queue depth (custom)
+    --apst          Enable APST: true|false (custom, NVMe only)
+    --write-cache   Enable write cache: true|false (custom, SATA only)
+    --read-ahead    Read ahead KB (custom)
+    --json          Saída JSON Lines
+    --dry-run       Simula sem aplicar
+    --verbose       Logs detalhados
+    --quiet         Apenas erros/resultados
+    --help          Esta ajuda
+
+EXEMPLOS:
+    ssd probe --json
+    ssd apply --profile balanced --json
+    ssd apply --profile custom --scheduler none --nr-requests 4096 --json
+    ssd status --json
+    ssd revert --json
+EOF
+}
+
+# ========== JSON HELPERS ==========
+json_emit() { [[ "$JSON_OUTPUT" == true ]] && printf '%s\n' "$1"; }
+json_progress() { json_emit "$(jq -n --arg type "progress" --arg stage "$1" --argjson current "$2" --argjson total "$3" --argjson percent "$4" --arg msg "$5" '{type:$type, stage:$stage, current:$current, total:$total, percent:$percent, message:$msg}')"; }
+json_result() { json_emit "$(jq -n --arg type "result" --arg section "$1" --argjson data "$2" '{type:$type, section:$section, data:$data}')"; }
+json_complete() { json_emit "$(jq -n --arg type "complete" --argjson exit_code "$1" --argjson duration_ms "$2" --arg msg "$3" '{type:$type, exit_code:$exit_code, duration_ms:$duration_ms, message:$msg}')"; }
+json_error() { json_emit "$(jq -n --arg type "error" --arg code "$1" --arg msg "$2" '{type:$type, code:$code, message:$msg}')"; }
+
+# ========== UTILITÁRIOS ==========
+ensure_state_dir() { mkdir -p "$STATE_DIR"; }
+
+root_check() { [[ $EUID -eq 0 ]] || { log_err "Root required"; return 1; }; }
+
+safe_read() { local p="$1"; [[ -r "$p" ]] && cat "$p" 2>/dev/null || return 1; }
+
+safe_write() {
+    local p="$1" v="$2" min="${3:-}" max="${4:-}"
+    [[ -w "$p" ]] || return 1
+    [[ -n "$min" && -n "$max" ]] && { (( v < min || v > max )) && return 1; }
+    echo "$v" > "$p" 2>/dev/null
+}
+
+safe_read_int() { local v=$(safe_read "$1"); [[ -n "$v" && "$v" =~ ^[0-9]+$ ]] && echo "$v"; }
+
+read_current_scheduler() {
+    local p="$1"
+    local content=$(safe_read "$p")
+    [[ -z "$content" ]] && return 1
+    for token in $content; do
+        token="${token#[}"; token="${token%]}"
+        [[ -n "$token" ]] && { echo "$token"; return; }
+    done
+}
+
+is_valid_sched() {
+    local s="$1"
+    for v in "${VALID_SCHEDS[@]}"; do [[ "$v" == "$s" ]] && return 0; done
+    return 1
+}
+
+probe_ssd() {
+    [[ -d "$BLOCK_BASE" ]] || { json_error "HARDWARE_NOT_FOUND" "Block sysfs not found"; return 1; }
+
+    local -a devices=()
+    for block in "$BLOCK_BASE"/*; do
+        [[ -d "$block" ]] || continue
+        local name=$(basename "$block")
+        [[ "$name" =~ ^nvme[0-9]+n[0-9]+$ ]] || [[ "$name" =~ ^sd[a-z]+$ ]] || continue
+
+        local rotational=$(safe_read "$block/queue/rotational")
+        [[ -n "$rotational" && "$rotational" -eq 0 ]] || continue
+
+        local sched_path="$block/queue/scheduler"
+        local nr_path="$block/queue/nr_requests"
+        local ra_path="$block/queue/read_ahead_kb"
+        [[ -f "$sched_path" && -f "$nr_path" && -f "$ra_path" ]] || continue
+
+        local avail_scheds=()
+        local content=$(safe_read "$sched_path")
+        for token in $content; do
+            token="${token#[}"; token="${token%]}"
+            is_valid_sched "$token" && avail_scheds+=("$token")
+        done
+        [[ ${#avail_scheds[@]} -eq 0 ]] && continue
+
+        local type="sata"
+        [[ "$name" =~ ^nvme ]] && type="nvme"
+
+        local model=$(safe_read "$block/device/model" || echo "unknown")
+        local fw_path="$block/device/firmware_rev"
+        [[ "$type" == "sata" ]] && fw_path="$block/device/rev"
+        local firmware=$(safe_read "$fw_path" || echo "unknown")
+
+        local apst_path=""
+        if [[ "$type" == "nvme" ]]; then
+            for base in "$block/device" "$block/device/../.."; do
+                [[ -f "$base/apst" ]] && { apst_path="$base/apst"; break; }
+            done
+        fi
+
+        local wce_path=""
+        if [[ "$type" == "sata" ]]; then
+            for base in "$block/device" "$block/queue"; do
+                [[ -f "$base/write_cache" ]] && { wce_path="$base/write_cache"; break; }
+            done
+        fi
+
+        devices+=($(jq -n \
+            --arg block "$block" --arg name "$name" --arg type "$type" \
+            --arg sched "$sched_path" --arg nr "$nr_path" --arg ra "$ra_path" \
+            --arg apst "${apst_path:-}" --arg wce "${wce_path:-}" \
+            --arg model "$model" --arg firmware "$firmware" \
+            --argjson scheds "$(printf '%s\n' "${avail_scheds[@]}" | jq -R . | jq -s .)" \
+            '{block:$block, name:$name, type:$type, scheduler_path:$sched, nr_requests_path:$nr, read_ahead_path:$ra, apst_path:$apst, wce_path:$wce, model:$model, firmware:$firmware, available_schedulers:$scheds}'))
+    done
+
+    [[ ${#devices[@]} -eq 0 ]] && { json_error "HARDWARE_NOT_FOUND" "No SSD/NVMe devices found"; return 1; }
+    printf '%s\n' "${devices[@]}" | jq -s .
+}
+
+apply_ssd() {
+    local profile="$1" sched="$2" nr_req="$3" apst_en="$4" wce_en="$5" ra_kb="$6"
+    root_check || { json_error "PERMISSION_DENIED" "Root required"; return 1; }
+
+    local devices_json
+    devices_json=$(probe_ssd) || return 1
+    local count=$(echo "$devices_json" | jq 'length')
+    [[ $count -eq 0 ]] && { json_error "HARDWARE_NOT_FOUND" "No SSD devices"; return 1; }
+
+    # Validação custom
+    if [[ "$profile" == "custom" ]]; then
+        [[ -n "$sched" ]] && is_valid_sched "$sched" || { json_error "INVALID_PROFILE" "Invalid scheduler: $sched"; return 1; }
+        [[ -n "$nr_req" ]] && (( nr_req >= NR_REQUESTS_MIN && nr_req <= NR_REQUESTS_MAX )) || { json_error "SAFE_MODE_VIOLATION" "nr_requests out of range"; return 1; }
+        [[ -n "$apst_en" ]] && [[ "$apst_en" =~ ^(true|false)$ ]] || { json_error "INVALID_PROFILE" "apst must be true/false"; return 1; }
+        [[ -n "$wce_en" ]] && [[ "$wce_en" =~ ^(true|false)$ ]] || { json_error "INVALID_PROFILE" "write_cache must be true/false"; return 1; }
+        [[ -n "$ra_kb" ]] && (( ra_kb >= READ_AHEAD_MIN && ra_kb <= READ_AHEAD_MAX )) || { json_error "SAFE_MODE_VIOLATION" "read_ahead out of range"; return 1; }
+    fi
+
+    ensure_state_dir
+    local -a reverted=() applied=() warnings=()
+    local start_ms=$(date +%s%3N)
+
+    for i in $(seq 0 $((count - 1))); do
+        local dev=$(echo "$devices_json" | jq ".[$i]")
+        local block=$(echo "$dev" | jq -r .block)
+        local name=$(echo "$dev" | jq -r .name)
+        local type=$(echo "$dev" | jq -r .type)
+        local sched_path=$(echo "$dev" | jq -r .scheduler_path)
+        local nr_path=$(echo "$dev" | jq -r .nr_requests_path)
+        local ra_path=$(echo "$dev" | jq -r .read_ahead_path)
+        local apst_path=$(echo "$dev" | jq -r .apst_path)
+        local wce_path=$(echo "$dev" | jq -r .wce_path)
+        local avail_scheds=$(echo "$dev" | jq -r '.available_schedulers | join(",")')
+
+        local orig_sched=$(read_current_scheduler "$sched_path")
+        local orig_nr=$(safe_read_int "$nr_path")
+        local orig_ra=$(safe_read_int "$ra_path")
+        local orig_apst=$(safe_read_int "$apst_path")
+        local orig_wce=$(safe_read_int "$wce_path")
+
+        reverted+=($(jq -n \
+            --arg block "$block" --arg sched "$orig_sched" --arg nr "$orig_nr" --arg ra "$orig_ra" \
+            --arg apst "$orig_apst" --arg wce "$orig_wce" \
+            '{block:$block, scheduler:$sched, nr_requests:$nr, read_ahead_kb:$ra, apst:$apst, write_cache:$wce}'))
+
+        [[ "$DRY_RUN" == true ]] && { log_warn "DRY-RUN: $name"; continue; }
+
+        # Determina valores do perfil
+        local p_sched="" p_nr="" p_apst="" p_wce="" p_ra=""
+        if [[ "$profile" == "custom" ]]; then
+            p_sched="$sched"
+            p_nr="$nr_req"
+            [[ "$apst_en" == "true" ]] && p_apst=1 || [[ "$apst_en" == "false" ]] && p_apst=0
+            [[ "$wce_en" == "true" ]] && p_wce=1 || [[ "$wce_en" == "false" ]] && p_wce=0
+            p_ra="$ra_kb"
+        elif [[ "$profile" == "silent" ]]; then
+            [[ "$avail_scheds" == *"$SCHED_MQ_DEADLINE"* ]] && p_sched="$SCHED_MQ_DEADLINE" || [[ "$avail_scheds" == *"$SCHED_BFQ"* ]] && p_sched="$SCHED_BFQ"
+            p_nr=128
+            p_apst=1
+            p_wce=1
+            p_ra=256
+        elif [[ "$profile" == "balanced" ]]; then
+            if [[ "$type" == "nvme" ]]; then
+                [[ "$avail_scheds" == *"$SCHED_NONE"* ]] && p_sched="$SCHED_NONE"
+            else
+                [[ "$avail_scheds" == *"$SCHED_MQ_DEADLINE"* ]] && p_sched="$SCHED_MQ_DEADLINE" || [[ "$avail_scheds" == *"$SCHED_KYBER"* ]] && p_sched="$SCHED_KYBER"
+            fi
+            p_nr="$orig_nr"
+            [[ "$type" == "nvme" ]] && p_apst=1
+            p_wce=1
+            p_ra="$orig_ra"
+        elif [[ "$profile" == "performance" ]]; then
+            [[ "$avail_scheds" == *"$SCHED_NONE"* ]] && p_sched="$SCHED_NONE"
+            p_nr=4096
+            p_apst=0
+            p_wce=1
+            p_ra=8192
+        fi
+
+        # Aplica
+        [[ -n "$p_sched" ]] && {
+            echo "$avail_scheds" | grep -qw "$p_sched" || { warnings+=("$name: Scheduler $p_sched not available"); p_sched=""; }
+            [[ -n "$p_sched" ]] && safe_write "$sched_path" "$p_sched" || warnings+=("$name: Failed to set scheduler")
+        }
+        [[ -n "$p_nr" ]] && safe_write "$nr_path" "$p_nr" $NR_REQUESTS_MIN $NR_REQUESTS_MAX || warnings+=("$name: Failed to set nr_requests")
+        [[ -n "$p_ra" ]] && safe_write "$ra_path" "$p_ra" $READ_AHEAD_MIN $READ_AHEAD_MAX || warnings+=("$name: Failed to set read_ahead")
+        [[ -n "$p_apst" && -n "$apst_path" ]] && safe_write "$apst_path" "$p_apst" 0 1 || warnings+=("$name: Failed to set APST")
+        [[ -n "$p_wce" && -n "$wce_path" ]] && safe_write "$wce_path" "$p_wce" 0 1 || warnings+=("$name: Failed to set write_cache")
+
+        applied+=($(jq -n \
+            --arg block "$block" --arg sched "$p_sched" --arg nr "$p_nr" --arg ra "$p_ra" \
+            --arg apst "$p_apst" --arg wce "$p_wce" \
+            '{block:$block, scheduler:$sched, nr_requests:$nr, read_ahead_kb:$ra, apst:$apst, write_cache:$wce}'))
+    done
+
+    local state=$(jq -n --argjson reverted "$(printf '%s\n' "${reverted[@]}" | jq -s .)" '{devices:$reverted}')
+    echo "$state" > "$STATE_FILE"
+
+    local end_ms=$(date +%s%3N)
+    local success=$(echo "$applied" | jq -s 'length > 0')
+    json_result "applied" "$(printf '%s\n' "${applied[@]}" | jq -s .)"
+    json_result "reverted" "$state"
+    [[ ${#warnings[@]} -gt 0 ]] && json_result "warnings" "$(printf '%s\n' "${warnings[@]}" | jq -R . | jq -s .)"
+    json_complete $([[ "$success" == true ]] && echo 0 || echo 1) $((end_ms - start_ms)) $([[ "$success" == true ]] && echo "SSD profile applied" || echo "No devices configured")
+}
+
+status_ssd() {
+    local devices_json
+    devices_json=$(probe_ssd) || return 1
+    local count=$(echo "$devices_json" | jq 'length')
+    local -a devices_out=()
+    local nvme_c=0 sata_c=0
+
+    for i in $(seq 0 $((count - 1))); do
+        local dev=$(echo "$devices_json" | jq ".[$i]")
+        local block=$(echo "$dev" | jq -r .block)
+        local name=$(echo "$dev" | jq -r .name)
+        local type=$(echo "$dev" | jq -r .type)
+        local sched_path=$(echo "$dev" | jq -r .scheduler_path)
+        local nr_path=$(echo "$dev" | jq -r .nr_requests_path)
+        local ra_path=$(echo "$dev" | jq -r .read_ahead_path)
+        local apst_path=$(echo "$dev" | jq -r .apst_path)
+        local wce_path=$(echo "$dev" | jq -r .wce_path)
+        local model=$(echo "$dev" | jq -r .model)
+        local firmware=$(echo "$dev" | jq -r .firmware)
+        local avail_scheds=$(echo "$dev" | jq -r '.available_schedulers | join(",")')
+
+        local curr_sched=$(read_current_scheduler "$sched_path")
+        local curr_nr=$(safe_read_int "$nr_path")
+        local curr_ra=$(safe_read_int "$ra_path")
+        local curr_apst=$(safe_read_int "$apst_path")
+        local curr_wce=$(safe_read_int "$wce_path")
+
+        [[ "$type" == "nvme" ]] && ((nvme_c++)) || ((sata_c++))
+
+        devices_out+=($(jq -n \
+            --arg block "$block" --arg name "$name" --arg type "$type" \
+            --arg model "$model" --arg firmware "$firmware" \
+            --arg sched "$curr_sched" --argjson avail "$avail_scheds" \
+            --arg nr "$curr_nr" --arg ra "$curr_ra" \
+            --arg apst "$curr_apst" --arg wce "$curr_wce" \
+            '{block:$block, name:$name, type:$type, model:$model, firmware:$firmware, scheduler:$sched, available_schedulers:($avail|split(",")), nr_requests:($nr|tonumber?), read_ahead_kb:($ra|tonumber?), apst_enabled:(if $apst=="" then null else ($apst|tonumber)==1 end), write_cache_enabled:(if $wce=="" then null else ($wce|tonumber)==1 end)}'))
+    done
+
+    local metrics=$(jq -n --argjson total "$count" --argjson nvme "$nvme_c" --argjson sata "$sata_c" '{total_devices:$total, nvme_count:$nvme, sata_count:$sata}')
+    json_result "status" "$(jq -n --arg profile "$(cat "$STATE_FILE" 2>/dev/null | jq -r .profile // \"unknown\")" --argjson metrics "$metrics" --argjson devices "$(printf '%s\n' "${devices_out[@]}" | jq -s .)" '{current_profile:$profile, metrics:$metrics, devices:$devices}')"
+}
+
+revert_ssd() {
+    [[ -f "$STATE_FILE" ]] || { json_error "HARDWARE_NOT_FOUND" "No saved state"; return 1; }
+    local state=$(cat "$STATE_FILE")
+    local count=$(echo "$state" | jq '.devices | length')
+    local -a reverted=() warnings=()
+    local success_count=0
+
+    local devices_json
+    devices_json=$(probe_ssd) || return 1
+
+    for i in $(seq 0 $((count - 1))); do
+        local st=$(echo "$state" | jq ".devices[$i]")
+        local block=$(echo "$st" | jq -r .block)
+        local dev=$(echo "$devices_json" | jq --arg b "$block" '.[] | select(.block==$b)')
+        [[ -z "$dev" ]] && { warnings+=("Device not found: $block"); continue; }
+
+        local name=$(echo "$dev" | jq -r .name)
+        local sched_path=$(echo "$dev" | jq -r .scheduler_path)
+        local nr_path=$(echo "$dev" | jq -r .nr_requests_path)
+        local ra_path=$(echo "$dev" | jq -r .read_ahead_path)
+        local apst_path=$(echo "$dev" | jq -r .apst_path)
+        local wce_path=$(echo "$dev" | jq -r .wce_path)
+        local avail_scheds=$(echo "$dev" | jq -r '.available_schedulers | join(",")')
+
+        local orig_sched=$(echo "$st" | jq -r .scheduler)
+        local orig_nr=$(echo "$st" | jq -r .nr_requests)
+        local orig_ra=$(echo "$st" | jq -r .read_ahead_kb)
+        local orig_apst=$(echo "$st" | jq -r .apst)
+        local orig_wce=$(echo "$st" | jq -r .write_cache)
+
+        [[ -n "$orig_sched" && "$orig_sched" != "null" ]] && {
+            echo "$avail_scheds" | grep -qw "$orig_sched" && safe_write "$sched_path" "$orig_sched" && ((success_count++)) || warnings+=("$name: Original scheduler not available")
+        }
+        [[ -n "$orig_nr" && "$orig_nr" != "null" ]] && safe_write "$nr_path" "$orig_nr" $NR_REQUESTS_MIN $NR_REQUESTS_MAX && ((success_count++)) || warnings+=("$name: Failed to restore nr_requests")
+        [[ -n "$orig_ra" && "$orig_ra" != "null" ]] && safe_write "$ra_path" "$orig_ra" $READ_AHEAD_MIN $READ_AHEAD_MAX && ((success_count++)) || warnings+=("$name: Failed to restore read_ahead")
+        [[ -n "$orig_apst" && "$orig_apst" != "null" && -n "$apst_path" ]] && safe_write "$apst_path" "$orig_apst" 0 1 && ((success_count++)) || warnings+=("$name: Failed to restore APST")
+        [[ -n "$orig_wce" && "$orig_wce" != "null" && -n "$wce_path" ]] && safe_write "$wce_path" "$orig_wce" 0 1 && ((success_count++)) || warnings+=("$name: Failed to restore write_cache")
+
+        reverted+=($(jq -n \
+            --arg block "$block" \
+            --arg sched "$orig_sched" --arg nr "$orig_nr" --arg ra "$orig_ra" \
+            --arg apst "$orig_apst" --arg wce "$orig_wce" \
+            '{block:$block, restored_scheduler:$sched, restored_nr_requests:$nr, restored_read_ahead_kb:$ra, restored_apst:$apst, restored_write_cache:$wce}'))
+    done
+
+    rm -f "$STATE_FILE"
+    json_result "reverted" "$(printf '%s\n' "${reverted[@]}" | jq -s .)"
+    [[ ${#warnings[@]} -gt 0 ]] && json_result "warnings" "$(printf '%s\n' "${warnings[@]}" | jq -R . | jq -s .)"
+    json_complete $([[ $success_count -gt 0 ]] && echo 0 || echo 1) 0 $([[ $success_count -gt 0 ]] && echo "SSD state reverted" || echo "No devices reverted")
+}
+
+# ========== MAIN ==========
+main() {
+    # Parse global options manually (getopts doesn't handle long options well)
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --json|-j) JSON_OUTPUT=true; shift ;;
+            --dry-run|-d) DRY_RUN=true; shift ;;
+            --verbose|-v) VERBOSE=true; shift ;;
+            --quiet|-q) QUIET=true; shift ;;
+            --help|-h) usage; exit 0 ;;
+            --) shift; break ;;
+            -*) log_err "Unknown option: $1"; usage; exit 4 ;;
+            *) break ;;
+        esac
+    done
+
+    local cmd="${1:-help}"
+    shift || true
+
+    local profile="" sched="" nr_req="" apst_en="" wce_en="" ra_kb=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --profile) profile="$2"; shift 2 ;;
+            --scheduler) sched="$2"; shift 2 ;;
+            --nr-requests) nr_req="$2"; shift 2 ;;
+            --apst) apst_en="$2"; shift 2 ;;
+            --write-cache) wce_en="$2"; shift 2 ;;
+            --read-ahead) ra_kb="$2"; shift 2 ;;
+            *) log_err "Unknown option: $1"; usage; exit 4 ;;
+        esac
+    done
+
+    case $cmd in
+        probe)
+            probe_ssd
+            ;;
+        apply)
+            [[ -n "$profile" ]] || { log_err "--profile required"; exit 4; }
+            apply_ssd "$profile" "$sched" "$nr_req" "$apst_en" "$wce_en" "$ra_kb"
+            ;;
+        status)
+            status_ssd
+            ;;
+        revert)
+            revert_ssd
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            log_err "Unknown command: $cmd"
+            usage
+            exit 4
+            ;;
+    esac
+}
+
+[[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"

@@ -1,5 +1,5 @@
 """nimd - Linux hardware optimization toolkit."""
 
-from .optimizers.fan import FanOptimizer
+from .cli import main
 
-__all__ = ["FanOptimizer"]
+__all__ = ["main"]

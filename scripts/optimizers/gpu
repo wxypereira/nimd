@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+# gpu — Otimizador de GPU (NVIDIA/AMD/Intel) via vendor tools + sysfs
+# Uso: gpu <probe|apply|status|revert> [opções]
+
+set -euo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common"
+
+# ========== CONSTANTES ==========
+readonly NVIDIA_SMI="nvidia-smi"
+readonly ROCM_SMI="rocm-smi"
+readonly INTEL_GPU_TOP="intel_gpu_top"
+readonly DRM_BASE="/sys/class/drm"
+readonly HWMON_BASE="/sys/class/hwmon"
+readonly STATE_DIR="/var/lib/nimd/state"
+readonly STATE_FILE="${STATE_DIR}/gpu.json"
+
+# Fatores de power limit por perfil
+declare -A POWER_FACTORS=(["silent"]=70 ["balanced"]=100 ["performance"]=100)
+
+JSON_OUTPUT=false
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+
+# ========== HELP ==========
+usage() {
+    cat <<'EOF'
+GPU Optimizer — NVIDIA/AMD/Intel power & clocks
+
+USO:
+    gpu <comando> [opções]
+
+COMANDOS:
+    probe           Detecta GPUs
+    apply           Aplica perfil (silent|balanced|performance|custom)
+    status          Mostra estado atual
+    revert          Restaura estado anterior
+
+OPÇÕES:
+    --profile <p>   Perfil: silent, balanced, performance, custom
+    --power-limit   Power limit em Watts (custom)
+    --core-offset   Core clock offset MHz (custom)
+    --mem-offset    Memory clock offset MHz (custom)
+    --perf-level    AMD perf level: auto|low|high (custom)
+    --json          Saída JSON Lines
+    --dry-run       Simula sem aplicar
+    --verbose       Logs detalhados
+    --quiet         Apenas erros/resultados
+    --help          Esta ajuda
+
+EXEMPLOS:
+    gpu probe --json
+    gpu apply --profile balanced --json
+    gpu apply --profile custom --power-limit 200 --core-offset 50 --json
+    gpu status --json
+    gpu revert --json
+EOF
+}
+
+# ========== JSON HELPERS ==========
+json_emit() { [[ "$JSON_OUTPUT" == true ]] && printf '%s\n' "$1"; }
+json_progress() { json_emit "$(jq -n --arg type "progress" --arg stage "$1" --argjson current "$2" --argjson total "$3" --argjson percent "$4" --arg msg "$5" '{type:$type, stage:$stage, current:$current, total:$total, percent:$percent, message:$msg}')"; }
+json_result() { json_emit "$(jq -n --arg type "result" --arg section "$1" --argjson data "$2" '{type:$type, section:$section, data:$data}')"; }
+json_complete() { json_emit "$(jq -n --arg type "complete" --argjson exit_code "$1" --argjson duration_ms "$2" --arg msg "$3" '{type:$type, exit_code:$exit_code, duration_ms:$duration_ms, message:$msg}')"; }
+json_error() { json_emit "$(jq -n --arg type "error" --arg code "$1" --arg msg "$2" '{type:$type, code:$code, message:$msg}')"; }
+
+# ========== UTILITÁRIOS ==========
+ensure_state_dir() { mkdir -p "$STATE_DIR"; }
+
+root_check() { [[ $EUID -eq 0 ]] || { log_err "Root required"; return 1; }; }
+
+safe_read() { local p="$1"; [[ -r "$p" ]] && cat "$p" 2>/dev/null || return 1; }
+
+safe_write() {
+    local p="$1" v="$2" min="${3:-}" max="${4:-}"
+    [[ -w "$p" ]] || return 1
+    [[ -n "$min" && -n "$max" ]] && { (( v < min || v > max )) && return 1; }
+    echo "$v" > "$p" 2>/dev/null
+}
+
+probe_nvidia() {
+    command -v "$NVIDIA_SMI" >/dev/null || return 0
+    local out
+    out=$($NVIDIA_SMI --query-gpu=index,name,uuid,pci.bus_id,driver_version,power.limit,power.default_limit,power.min_limit,power.max_limit --format=csv,noheader,nounits 2>/dev/null) || return 0
+    [[ -z "$out" ]] && return 0
+
+    local -a devices=()
+    while IFS=',' read -r idx name uuid bus driver pl def pmin pmax; do
+        idx=$(echo "$idx" | xargs)
+        name=$(echo "$name" | xargs)
+        uuid=$(echo "$uuid" | xargs)
+        bus=$(echo "$bus" | xargs)
+        driver=$(echo "$driver" | xargs)
+        pl=$(echo "$pl" | xargs)
+        pmin=$(echo "$pmin" | xargs)
+        pmax=$(echo "$pmax" | xargs)
+
+        local hwmon_path=""
+        for hw in "$HWMON_BASE"/hwmon*; do
+            [[ "$(safe_read "$hw/name")" == "nvidia" ]] && { hwmon_path="$hw"; break; }
+        done
+
+        local paths=()
+        [[ -n "$hwmon_path" ]] && {
+            paths+=("power_limit:$hwmon_path/power1_cap")
+            paths+=("power_min:$hwmon_path/power1_cap_min")
+            paths+=("power_max:$hwmon_path/power1_cap_max")
+            paths+=("temp:$hwmon_path/temp1_input")
+            paths+=("power_draw:$hwmon_path/power1_input")
+            paths+=("util_gpu:$hwmon_path/gpu_busy_percent")
+            paths+=("util_mem:$hwmon_path/vram_busy_percent")
+            paths+=("clk_gfx:$hwmon_path/freq1_input")
+            paths+=("clk_mem:$hwmon_path/freq2_input")
+        }
+
+        local orig_limit=""
+        [[ "$pl" != "[Not Supported]" ]] && orig_limit=$(echo "$pl * 1000000" | bc -l | cut -d. -f1)
+        [[ -z "$orig_limit" && "$pmax" != "[Not Supported]" ]] && orig_limit=$(echo "$pmax * 1000000" | bc -l | cut -d. -f1)
+
+        devices+=($(jq -n \
+            --arg index "$idx" --arg vendor "nvidia" --arg name "$name" --arg uuid "$uuid" \
+            --arg bus "$bus" --arg driver "$driver" \
+            --argjson paths "$(printf '%s\n' "${paths[@]}" | jq -R . | jq -s .)" \
+            --arg orig_limit "$orig_limit" \
+            --arg pmin "$pmin" --arg pmax "$pmax" \
+            '{index:$index, vendor:$vendor, name:$name, uuid:$uuid, bus_id:$bus, driver_version:$driver, paths:($paths|map(split(":"))|map({(.[0]):.[1]})|add), original:{power_limit:$orig_limit, power_min_w:$pmin, power_max_w:$pmax}}'))
+    done <<< "$out"
+    printf '%s\n' "${devices[@]}"
+}
+
+probe_amd() {
+    command -v "$ROCM_SMI" >/dev/null || return 0
+    local rocm_data=()
+    local out
+    out=$($ROCM_SMI --showproductname --showuniqueid --showdriverversion --csv 2>/dev/null) || true
+    if [[ -n "$out" ]]; then
+        while IFS=',' read -r r_idx r_name r_uuid r_driver; do
+            [[ "$r_idx" =~ ^[0-9]+$ ]] && rocm_data["$r_idx"]=$(jq -n --arg name "$(echo "$r_name" | xargs)" --arg uuid "$(echo "$r_uuid" | xargs)" --arg driver "$(echo "$r_driver" | xargs)" '{name:$name, uuid:$uuid, driver:$driver}')
+        done <<< "$(echo "$out" | tail -n +2)"
+    fi
+
+    local -a devices=()
+    for card in "$DRM_BASE"/card*; do
+        [[ -d "$card" ]] || continue
+        local dev_path="$card/device"
+        [[ -d "$dev_path" ]] || continue
+        [[ "$(safe_read "$dev_path/vendor")" == "0x1002" ]] || continue
+
+        local idx=${#devices[@]}
+        local r="${rocm_data[$idx]:-{}}"
+        local name=$(echo "$r" | jq -r .name // $(safe_read "$dev_path/product_name" || echo "$card"))
+        local uuid=$(echo "$r" | jq -r .uuid // $(safe_read "$(find "$dev_path" -name '*unique*' 2>/dev/null | head -1)" || echo "amd-$card"))
+        local driver=$(echo "$r" | jq -r .driver // "amdgpu")
+        local bus=$(safe_read "$dev_path/uevent" | grep PCI_SLOT_NAME | cut -d= -f2)
+
+        local hwmon_path=""
+        for hw in "$HWMON_BASE"/hwmon*; do
+            [[ "$(safe_read "$hw/name")" == *"amdgpu"* ]] && { hwmon_path="$hw"; break; }
+        done
+
+        local paths=() perf_level="" pp_table=""
+        [[ -n "$hwmon_path" ]] && {
+            paths+=("power_limit:$hwmon_path/power1_cap")
+            paths+=("power_min:$hwmon_path/power1_cap_min")
+            paths+=("power_max:$hwmon_path/power1_cap_max")
+            paths+=("temp:$hwmon_path/temp1_input")
+            paths+=("power_draw:$hwmon_path/power1_input")
+            paths+=("util_gpu:$hwmon_path/gpu_busy_percent")
+            paths+=("util_mem:$hwmon_path/vram_busy_percent")
+            paths+=("clk_gfx:$hwmon_path/freq1_input")
+            paths+=("clk_mem:$hwmon_path/freq2_input")
+        }
+        [[ -f "$dev_path/power_dpm_force_performance_level" ]] && perf_level="$dev_path/power_dpm_force_performance_level"
+        [[ -f "$dev_path/pp_table" ]] && pp_table="$dev_path/pp_table"
+        [[ -n "$perf_level" ]] && paths+=("perf_level:$perf_level")
+        [[ -n "$pp_table" ]] && paths+=("pp_table:$pp_table")
+
+        devices+=($(jq -n \
+            --argjson index "$idx" --arg vendor "amd" --arg name "$name" --arg uuid "$uuid" \
+            --arg bus "$bus" --arg driver "$driver" \
+            --argjson paths "$(printf '%s\n' "${paths[@]}" | jq -R . | jq -s .)" \
+            '{index:$index, vendor:$vendor, name:$name, uuid:$uuid, bus_id:$bus, driver_version:$driver, paths:($paths|map(split(":"))|map({(.[0]):.[1]})|add), original:{}}'))
+    done
+    printf '%s\n' "${devices[@]}"
+}
+
+probe_intel() {
+    command -v "$INTEL_GPU_TOP" >/dev/null || return 0
+    local -a devices=()
+    for card in "$DRM_BASE"/card*; do
+        [[ -d "$card" ]] || continue
+        local dev_path="$card/device"
+        [[ -d "$dev_path" ]] || continue
+        [[ "$(safe_read "$dev_path/vendor")" == "0x8086" ]] || continue
+        [[ "$(safe_read "$dev_path/class" | cut -c1-4)" == "0x03" ]] || continue
+
+        local idx=${#devices[@]}
+        local name=$(safe_read "$dev_path/product_name" || echo "$card")
+        local uuid="intel-$card"
+        local bus=$(safe_read "$dev_path/uevent" | grep PCI_SLOT_NAME | cut -d= -f2)
+
+        local hwmon_path=""
+        for hw in "$HWMON_BASE"/hwmon*; do
+            local hn=$(safe_read "$hw/name")
+            [[ "$hn" == *"i915"* || "$hn" == *"intel"* ]] && { hwmon_path="$hw"; break; }
+        done
+
+        local paths=()
+        [[ -n "$hwmon_path" ]] && {
+            paths+=("power_limit:$hwmon_path/power1_cap")
+            paths+=("power_min:$hwmon_path/power1_cap_min")
+            paths+=("power_max:$hwmon_path/power1_cap_max")
+            paths+=("temp:$hwmon_path/temp1_input")
+            paths+=("power_draw:$hwmon_path/power1_input")
+            paths+=("util_gpu:$hwmon_path/gpu_busy_percent")
+            paths+=("mem_used:$hwmon_path/vram_used_bytes")
+            paths+=("mem_total:$hwmon_path/vram_total_bytes")
+        }
+
+        devices+=($(jq -n \
+            --argjson index "$idx" --arg vendor "intel" --arg name "$name" --arg uuid "$uuid" \
+            --arg bus "$bus" --arg driver "i915" \
+            --argjson paths "$(printf '%s\n' "${paths[@]}" | jq -R . | jq -s .)" \
+            '{index:$index, vendor:$vendor, name:$name, uuid:$uuid, bus_id:$bus, driver_version:$driver, paths:($paths|map(split(":"))|map({(.[0]):.[1]})|add), original:{}}'))
+    done
+    printf '%s\n' "${devices[@]}"
+}
+
+probe_gpu() {
+    local -a all_devices=()
+    for fn in probe_nvidia probe_amd probe_intel; do
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && all_devices+=("$line")
+        done < <($fn)
+    done
+    if [[ ${#all_devices[@]} -eq 0 ]]; then
+        json_error "HARDWARE_NOT_FOUND" "No GPU devices found"
+        return 1
+    fi
+    printf '%s\n' "${all_devices[@]}" | jq -s .
+}
+
+apply_gpu() {
+    local profile="$1" power_limit="$2" core_offset="$3" mem_offset="$4" perf_level="$5"
+    root_check || { json_error "PERMISSION_DENIED" "Root required"; return 1; }
+
+    local devices_json
+    devices_json=$(probe_gpu) || return 1
+    local count=$(echo "$devices_json" | jq 'length')
+    [[ $count -eq 0 ]] && { json_error "HARDWARE_NOT_FOUND" "No GPU devices"; return 1; }
+
+    ensure_state_dir
+    local -a reverted=() applied=() warnings=()
+    local start_ms=$(date +%s%3N)
+
+    for i in $(seq 0 $((count - 1))); do
+        local dev=$(echo "$devices_json" | jq ".[$i]")
+        local idx=$(echo "$dev" | jq -r .index)
+        local vendor=$(echo "$dev" | jq -r .vendor)
+        local uuid=$(echo "$dev" | jq -r .uuid)
+
+        # Captura estado original
+        local orig_state=$(jq -n --argjson idx "$idx" --arg vendor "$vendor" --arg uuid "$uuid" '{index:$idx, vendor:$vendor, uuid:$uuid}')
+        for key in power_limit core_offset mem_offset perf_level; do
+            local path=$(echo "$dev" | jq -r ".paths.$key // empty")
+            [[ -n "$path" && -f "$path" ]] && {
+                local val=$(safe_read "$path")
+                [[ -n "$val" ]] && orig_state=$(echo "$orig_state" | jq --arg key "$key" --arg val "$val" '.original[$key]=$val')
+            }
+        done
+        reverted+=("$orig_state")
+
+        [[ "$DRY_RUN" == true ]] && { log_warn "DRY-RUN: $vendor GPU $idx"; continue; }
+
+        local dev_applied=$(jq -n --argjson idx "$idx" --arg vendor "$vendor" --arg uuid "$uuid" '{index:$idx, vendor:$vendor, uuid:$uuid, settings:{}}')
+
+        # Power limit
+        local pmin_path=$(echo "$dev" | jq -r .paths.power_min // empty)
+        local pmax_path=$(echo "$dev" | jq -r .paths.power_max // empty)
+        local pl_path=$(echo "$dev" | jq -r .paths.power_limit // empty)
+        if [[ -n "$pmin_path" && -n "$pmax_path" && -f "$pmin_path" && -f "$pmax_path" ]]; then
+            local min_uw=$(safe_read "$pmin_path" || echo 0)
+            local max_uw=$(safe_read "$pmax_path" || echo 0)
+            (( min_uw > 0 && max_uw > 0 )) && {
+                local min_w=$((min_uw / 1000000))
+                local max_w=$((max_uw / 1000000))
+                local target_w=$max_w
+                if [[ "$profile" == "custom" && -n "$power_limit" ]]; then
+                    target_w=$power_limit
+                else
+                    local factor=${POWER_FACTORS[$profile]:-100}
+                    target_w=$((max_w * factor / 100))
+                fi
+                (( target_w < min_w )) && target_w=$min_w
+                (( target_w > max_w )) && target_w=$max_w
+                safe_write "$pl_path" $((target_w * 1000000)) $min_uw $max_uw && \
+                    dev_applied=$(echo "$dev_applied" | jq --argjson w "$target_w" '.settings.power_limit_w=$w')
+            }
+        fi
+
+        # Vendor-specific
+        case "$vendor" in
+            nvidia)
+                local co=0 mo=0
+                [[ "$profile" == "custom" ]] && { co=${core_offset:-0}; mo=${mem_offset:-0}; }
+                [[ "$profile" == "performance" ]] && { co=100; mo=500; }
+                [[ "$profile" == "silent" ]] && { co=-100; mo=-200; }
+                (( co != 0 )) && {
+                    $NVIDIA_SMI -i "$idx" -ac "${co},${mo}" >/dev/null 2>&1 && \
+                        dev_applied=$(echo "$dev_applied" | jq --argjson v "$co" '.settings.core_clock_offset=$v')
+                }
+                (( mo != 0 )) && {
+                    dev_applied=$(echo "$dev_applied" | jq --argjson v "$mo" '.settings.mem_clock_offset=$v')
+                }
+                ;;
+            amd)
+                local pl_path2=$(echo "$dev" | jq -r .paths.perf_level // empty)
+                [[ -n "$pl_path2" && -f "$pl_path2" ]] && {
+                    local level="auto"
+                    [[ "$profile" == "silent" ]] && level="low"
+                    [[ "$profile" == "performance" ]] && level="high"
+                    [[ "$profile" == "custom" && -n "$perf_level" ]] && level="$perf_level"
+                    safe_write "$pl_path2" "$level" && \
+                        dev_applied=$(echo "$dev_applied" | jq --arg v "$level" '.settings.perf_level=$v')
+                }
+                # rocm-smi clock offsets
+                [[ "$profile" == "custom" && -n "$core_offset" ]] && {
+                    $ROCM_SMI --setclk "$core_offset" -d "$idx" >/dev/null 2>&1 && \
+                        dev_applied=$(echo "$dev_applied" | jq --argjson v "$core_offset" '.settings.core_clock_offset_mhz=$v')
+                }
+                [[ "$profile" == "custom" && -n "$mem_offset" ]] && {
+                    $ROCM_SMI --setmclk "$mem_offset" -d "$idx" >/dev/null 2>&1 && \
+                        dev_applied=$(echo "$dev_applied" | jq --argjson v "$mem_offset" '.settings.mem_clock_offset_mhz=$v')
+                }
+                [[ "$profile" == "performance" ]] && {
+                    dev_applied=$(echo "$dev_applied" | jq '.settings.pp_table_modified=true | .settings.core_clock_offset_pct=5 | .settings.mem_clock_offset_pct=10')
+                }
+                [[ "$profile" == "silent" ]] && {
+                    dev_applied=$(echo "$dev_applied" | jq '.settings.pp_table_modified=true | .settings.core_clock_offset_pct=-5 | .settings.mem_clock_offset_pct=-10')
+                }
+                ;;
+            intel)
+                [[ "$profile" == "custom" ]] && {
+                    [[ -n "$core_offset" ]] && dev_applied=$(echo "$dev_applied" | jq --argjson v "$core_offset" '.settings.core_clock_offset_requested=$v')
+                    [[ -n "$mem_offset" ]] && dev_applied=$(echo "$dev_applied" | jq --argjson v "$mem_offset" '.settings.mem_clock_offset_requested=$v')
+                }
+                ;;
+        esac
+
+        [[ "$(echo "$dev_applied" | jq '.settings | length')" -gt 0 ]] && applied+=("$dev_applied")
+    done
+
+    local state=$(jq -n --argjson reverted "$(printf '%s\n' "${reverted[@]}" | jq -s .)" '{devices:$reverted}')
+    echo "$state" > "$STATE_FILE"
+
+    local end_ms=$(date +%s%3N)
+    local success=$(echo "$applied" | jq -s 'length > 0')
+    json_result "applied" "$(printf '%s\n' "${applied[@]}" | jq -s .)"
+    json_result "reverted" "$state"
+    [[ ${#warnings[@]} -gt 0 ]] && json_result "warnings" "$(printf '%s\n' "${warnings[@]}" | jq -R . | jq -s .)"
+    json_complete $([[ "$success" == true ]] && echo 0 || echo 1) $((end_ms - start_ms)) $([[ "$success" == true ]] && echo "GPU profile applied" || echo "No devices configured")
+}
+
+status_gpu() {
+    local devices_json
+    devices_json=$(probe_gpu) || return 1
+    local count=$(echo "$devices_json" | jq 'length')
+    local -a devices_out=()
+    local -A by_vendor=()
+
+    for i in $(seq 0 $((count - 1))); do
+        local dev=$(echo "$devices_json" | jq ".[$i]")
+        local info=$(jq -n \
+            --argjson idx "$(echo "$dev" | jq .index)" \
+            --arg vendor "$(echo "$dev" | jq -r .vendor)" \
+            --arg name "$(echo "$dev" | jq -r .name)" \
+            --arg uuid "$(echo "$dev" | jq -r .uuid)" \
+            --arg bus "$(echo "$dev" | jq -r .bus_id)" \
+            --arg driver "$(echo "$dev" | jq -r .driver_version)" \
+            '{index:$idx, vendor:$vendor, name:$name, uuid:$uuid, bus_id:$bus, driver_version:$driver}')
+
+        local readers=(
+            "temp:temperature_c:1000"
+            "util_gpu:utilization_gpu_percent:1"
+            "util_mem:utilization_mem_percent:1"
+            "power_draw:power_draw_w:1000000"
+            "power_limit:power_limit_w:1000000"
+            "clk_gfx:clock_graphics_mhz:1"
+            "clk_mem:clock_memory_mhz:1"
+            "mem_used:memory_used_mb:1048576"
+            "mem_total:memory_total_mb:1048576"
+            "perf_level:perf_level:1"
+        )
+
+        for r in "${readers[@]}"; do
+            local key="${r%%:*}"; r="${r#*:}"; local out_key="${r%%:*}"; local div="${r##*:}"
+            local path=$(echo "$dev" | jq -r ".paths.$key // empty")
+            [[ -n "$path" && -f "$path" ]] && {
+                local val=$(safe_read "$path")
+                [[ -n "$val" && "$val" =~ ^[0-9]+$ ]] && {
+                    if [[ $div -eq 1 ]]; then
+                        info=$(echo "$info" | jq --arg key "$out_key" --argjson val "$val" '. + {($key):$val}')
+                    else
+                        local conv=$((val / div))
+                        [[ "$out_key" == "power_draw_w" || "$out_key" == "power_limit_w" ]] && conv=$(echo "scale=1; $val / $div" | bc -l)
+                        info=$(echo "$info" | jq --arg key "$out_key" --argjson val "$conv" '. + {($key):$val}')
+                    fi
+                }
+            }
+        done
+
+        devices_out+=("$info")
+        local v=$(echo "$dev" | jq -r .vendor)
+        by_vendor["$v,count"]=$((${by_vendor["$v,count"]:-0} + 1))
+        local pw=$(echo "$info" | jq -r .power_draw_w // 0)
+        by_vendor["$v,power"]=$(echo "${by_vendor["$v,power"]:-0} + $pw" | bc -l)
+    done
+
+    local metrics=$(jq -n --argjson total "$count" --argjson by_vendor "$(for v in "${!by_vendor[@]}"; do [[ "$v" == *,count ]] && { vn="${v%,count}"; echo "$vn: {\"count\":${by_vendor[$v]}, \"total_power_w\":${by_vendor[$v,power]}}"; }; done | jq -s 'add // {}')" '{total_devices:$total, by_vendor:$by_vendor}')
+    json_result "status" "$(jq -n --arg profile "$(cat "$STATE_FILE" 2>/dev/null | jq -r .profile // \"unknown\")" --argjson metrics "$metrics" --argjson devices "$(printf '%s\n' "${devices_out[@]}" | jq -s .)" '{current_profile:$profile, metrics:$metrics, devices:$devices}')"
+}
+
+revert_gpu() {
+    [[ -f "$STATE_FILE" ]] || { json_error "HARDWARE_NOT_FOUND" "No saved state"; return 1; }
+    root_check || { json_error "PERMISSION_DENIED" "Root required for revert"; return 1; }
+    local state=$(cat "$STATE_FILE")
+    local count=$(echo "$state" | jq '.devices | length')
+    local -a reverted=() warnings=()
+    local ok_count=0
+
+    local devices_json
+    devices_json=$(probe_gpu) || return 1
+
+    for i in $(seq 0 $((count - 1))); do
+        local st=$(echo "$state" | jq ".devices[$i]")
+        local uuid=$(echo "$st" | jq -r .uuid)
+        local dev=$(echo "$devices_json" | jq --arg u "$uuid" '.[] | select(.uuid==$u)')
+        [[ -z "$dev" ]] && { warnings+=("Device not found: $uuid"); continue; }
+
+        local idx=$(echo "$dev" | jq -r .index)
+        local vendor=$(echo "$dev" | jq -r .vendor)
+        local pl_path=$(echo "$dev" | jq -r .paths.power_limit // empty)
+        local perf_path=$(echo "$dev" | jq -r .paths.perf_level // empty)
+        local ok=true
+
+        [[ -n "$pl_path" && -f "$pl_path" ]] && {
+            local orig_pl=$(echo "$st" | jq -r .original.power_limit // empty)
+            [[ -n "$orig_pl" && "$orig_pl" != "null" ]] && safe_write "$pl_path" "$orig_pl" || ok=false
+        }
+
+        [[ "$vendor" == "nvidia" ]] && {
+            $NVIDIA_SMI -i "$idx" -rac >/dev/null 2>&1 || ok=false
+        }
+        [[ "$vendor" == "amd" && -n "$perf_path" && -f "$perf_path" ]] && {
+            local orig_perf=$(echo "$st" | jq -r .original.perf_level // empty)
+            [[ -n "$orig_perf" && "$orig_perf" != "null" ]] && safe_write "$perf_path" "$orig_perf" || ok=false
+        }
+
+        [[ "$ok" == true ]] && ((ok_count++))
+        reverted+=($(jq -n --argjson idx "$idx" --arg vendor "$vendor" --arg uuid "$uuid" --argjson ok "$ok" '{index:$idx, vendor:$vendor, uuid:$uuid, restored:$ok}'))
+    done
+
+    rm -f "$STATE_FILE"
+    json_result "reverted" "$(printf '%s\n' "${reverted[@]}" | jq -s .)"
+    [[ ${#warnings[@]} -gt 0 ]] && json_result "warnings" "$(printf '%s\n' "${warnings[@]}" | jq -R . | jq -s .)"
+    json_complete $([[ $ok_count -gt 0 ]] && echo 0 || echo 1) 0 $([[ $ok_count -gt 0 ]] && echo "GPU state reverted" || echo "No devices reverted")
+}
+
+# ========== MAIN ==========
+main() {
+    # Parse global options manually (getopts doesn't handle long options well)
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --json|-j) JSON_OUTPUT=true; shift ;;
+            --dry-run|-d) DRY_RUN=true; shift ;;
+            --verbose|-v) VERBOSE=true; shift ;;
+            --quiet|-q) QUIET=true; shift ;;
+            --help|-h) usage; exit 0 ;;
+            --) shift; break ;;
+            -*) log_err "Unknown option: $1"; usage; exit 4 ;;
+            *) break ;;
+        esac
+    done
+
+    local cmd="${1:-help}"
+    shift || true
+
+    local profile="" power_limit="" core_offset="" mem_offset="" perf_level=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --profile) profile="$2"; shift 2 ;;
+            --power-limit) power_limit="$2"; shift 2 ;;
+            --core-offset) core_offset="$2"; shift 2 ;;
+            --mem-offset) mem_offset="$2"; shift 2 ;;
+            --perf-level) perf_level="$2"; shift 2 ;;
+            *) log_err "Unknown option: $1"; usage; exit 4 ;;
+        esac
+    done
+
+    case $cmd in
+        probe)
+            probe_gpu
+            ;;
+        apply)
+            [[ -n "$profile" ]] || { log_err "--profile required"; exit 4; }
+            apply_gpu "$profile" "$power_limit" "$core_offset" "$mem_offset" "$perf_level"
+            ;;
+        status)
+            status_gpu
+            ;;
+        revert)
+            revert_gpu
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            log_err "Unknown command: $cmd"
+            usage
+            exit 4
+            ;;
+    esac
+}
+
+[[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"
