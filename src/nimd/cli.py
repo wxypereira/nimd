@@ -8,14 +8,14 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-SCRIPTS_DIR = Path(__file__).parent.parent.parent / "scripts" / "optimizers"
+SCRIPTS_DIR = Path(__file__).parent.parent.parent / "scripts"
 STATE_DIR = Path("/var/lib/nimd/state")
 
 OPTIMIZERS = {
-    "fan": SCRIPTS_DIR / "fan",
-    "gpu": SCRIPTS_DIR / "gpu",
-    "ssd": SCRIPTS_DIR / "ssd",
-    "hdd": SCRIPTS_DIR / "hdd",
+    "fan": SCRIPTS_DIR / "optimize-fan",
+    "gpu": SCRIPTS_DIR / "optimize-gpu",
+    "ssd": SCRIPTS_DIR / "optimize-ssd",
+    "hdd": SCRIPTS_DIR / "optimize-hdd",
 }
 
 

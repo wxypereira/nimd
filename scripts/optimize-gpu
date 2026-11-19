@@ -5,7 +5,7 @@
 set -euo pipefail
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../lib/common"
+source "${SCRIPT_DIR}/lib/common"
 
 # ========== CONSTANTES ==========
 readonly NVIDIA_SMI="nvidia-smi"
