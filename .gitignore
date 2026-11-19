@@ -5,12 +5,15 @@ benchmarks/*.log
 benchmarks/*.md
 !benchmarks/.gitkeep
 
-# Working docs / loose files (not part of project)
+# Working docs
 TICKETS.md
 ARCHITECTURE_HYBRID.md
 .SRCINFO
-.goosehints
 skills-lock.json
+.agents
+.claude
+agent
+contitution.md
 
 # Python
 __pycache__/
@@ -60,13 +63,13 @@ gui-electron/node_modules/
 gui-electron/dist/
 gui-electron/*.log
 
-# Secrets (precaução)
+# Secrets
 .env
 .env.*
 !.env.example
 .goosehints
 
-# Memory log (memória persistente do projeto - não versionar)
+# Memory log
 mem.md
 
 # Logs
