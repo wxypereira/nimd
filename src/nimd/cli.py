@@ -12,10 +12,10 @@ SCRIPTS_DIR = Path(__file__).parent.parent.parent / "scripts"
 STATE_DIR = Path("/var/lib/nimd/state")
 
 OPTIMIZERS = {
-    "fan": SCRIPTS_DIR / "optimize-fan",
-    "gpu": SCRIPTS_DIR / "optimize-gpu",
-    "ssd": SCRIPTS_DIR / "optimize-ssd",
-    "hdd": SCRIPTS_DIR / "optimize-hdd",
+    "fan": SCRIPTS_DIR / "fan",
+    "gpu": SCRIPTS_DIR / "gpu",
+    "ssd": SCRIPTS_DIR / "ssd",
+    "hdd": SCRIPTS_DIR / "hdd",
 }
 
 
